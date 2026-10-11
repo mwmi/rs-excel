@@ -1,0 +1,10 @@
+[package]
+name = "rs-excel-cli"
+version = "0.1.0"
+edition = "2021"
+description = "rs-excel 库的交互式 REPL 测试工具"
+
+[dependencies]
+rs-excel = { path = "../rs-excel" }
+anyhow = "1"
+reedline = "0.52.1"

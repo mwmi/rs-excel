@@ -1,0 +1,18 @@
+[package]
+name = "rs-excel"
+version = "0.1.0"
+edition = "2021"
+description = "Rust + COM 自动化 WPS/Excel 表格库（Windows 专用，IDispatch 后期绑定）"
+
+[dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",      # HANDLE / CloseHandle（进程控制）
+    "Win32_System_Com",      # CoInitialize / CoCreateInstance / IDispatch / SafeArray
+    "Win32_System_Ole",      # GetActiveObject / DISPID_PROPERTYPUT
+    "Win32_System_Variant",  # VARIANT / BSTR / VT_* 常量
+    "Win32_Globalization",   # LOCALE_USER_DEFAULT
+    "Win32_System_Diagnostics_ToolHelp", # 进程快照（process.rs）
+    "Win32_System_Threading",            # OpenProcess / TerminateProcess / QueryFullProcessImageNameW
+    "Win32_UI_WindowsAndMessaging",      # GetWindowThreadProcessId（连接归属校验）
+] }
+anyhow = "1"
