@@ -15,6 +15,8 @@ pub enum AlignH {
     Left = -4131,
     Center = -4108,
     Right = -4152,
+    Justify = -4130,
+    Distributed = -4117,
 }
 
 /// 垂直对齐（xlVAlign 常量）。
@@ -23,6 +25,8 @@ pub enum AlignV {
     Top = -4160,
     Center = -4108,
     Bottom = -4107,
+    Justify = -4130,
+    Distributed = -4117,
 }
 
 /// `End` 方向（等价 Ctrl+方向键，xlUp/xlDown/xlToLeft/xlToRight）。
@@ -249,6 +253,81 @@ impl Range {
             self.raw.put("WrapText", vec![w.into()])?;
         }
         Ok(())
+    }
+
+    /// 水平对齐原始值（xlHAlign，1 = 常规）。
+    pub fn h_align(&self) -> Result<i32> {
+        self.raw.get("HorizontalAlignment")?.int()
+    }
+
+    /// 垂直对齐原始值（xlVAlign）。
+    pub fn v_align(&self) -> Result<i32> {
+        self.raw.get("VerticalAlignment")?.int()
+    }
+
+    /// 是否自动换行（多段显示必须开）。
+    pub fn wrap_text(&self) -> Result<bool> {
+        self.raw.get("WrapText")?.bool()
+    }
+
+    /// 缩进级别（0~15）。
+    pub fn indent(&self) -> Result<i32> {
+        self.raw.get("IndentLevel")?.int()
+    }
+
+    pub fn set_indent(&self, level: i32) -> Result<()> {
+        self.raw.put("IndentLevel", vec![level.into()])
+    }
+
+    /// 文字方向（角度 -90~90，竖排为 -4166）。
+    pub fn orientation(&self) -> Result<i32> {
+        self.raw.get("Orientation")?.int()
+    }
+
+    pub fn set_orientation(&self, deg: i32) -> Result<()> {
+        self.raw.put("Orientation", vec![deg.into()])
+    }
+
+    /// 是否缩小字体填充。
+    pub fn shrink(&self) -> Result<bool> {
+        self.raw.get("ShrinkToFit")?.bool()
+    }
+
+    pub fn set_shrink(&self, on: bool) -> Result<()> {
+        self.raw.put("ShrinkToFit", vec![on.into()])
+    }
+
+    // ── 部分字符（单元格内局部文字格式，1 基） ──
+
+    /// 引用第 `start` 个字符起 `len` 个字符的字体（按段落局部格式化的核心入口）。
+    pub fn char_font(&self, start: i32, len: i32) -> Result<Font> {
+        Ok(Font::from_raw(
+            self.characters(start, len)?
+                .get_obj("Font", "Chars.Font")?,
+        ))
+    }
+
+    /// 读取部分文本。
+    pub fn char_text(&self, start: i32, len: i32) -> Result<String> {
+        self.characters(start, len)?.get("Text")?.string()
+    }
+
+    /// 替换部分文本（新文本长度可不同于原文，即插入/删除）。
+    pub fn set_char_text(&self, start: i32, len: i32, text: &str) -> Result<()> {
+        self.characters(start, len)?
+            .put("Text", vec![text.into()])
+            .map_err(|e| ExcelError::hint(e, "替换长度可不同（插入/删除），但 start+len 须不超过原文本长度"))
+    }
+
+    /// Characters(start, len) 对象。start/len 均 1 基且 ≥1。
+    fn characters(&self, start: i32, len: i32) -> Result<IDispatchWrapper> {
+        if start < 1 || len < 1 {
+            bail!("Characters 参数须 ≥1（得到 start={start}, len={len}）");
+        }
+        self.raw
+            .call("Characters", vec![start.into(), len.into()])?
+            .idispatch_child(&format!("Chars({start},{len})"))
+            .map_err(|e| ExcelError::hint(e, "start+len 不得超过单元格文本长度（可先 get 读取确认）"))
     }
 
     pub fn set_col_width(&self, w: f64) -> Result<()> {

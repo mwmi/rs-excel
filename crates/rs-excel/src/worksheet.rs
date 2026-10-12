@@ -8,6 +8,7 @@ use crate::com::variant::{CellValue, ComValue};
 use crate::error::{ole_to_hex, ExcelError};
 use crate::pagesetup::PageSetup;
 use crate::range::Range;
+use crate::shape::Shapes;
 
 /// 工作表（Worksheet COM 对象）。
 pub struct Worksheet {
@@ -212,6 +213,11 @@ impl Worksheet {
         let end = format!("{}{}", num_to_col(c0 + cols - 1), r0 + rows - 1);
         let rng = self.range(&format!("{anchor}:{end}"))?;
         rng.set_values(&grid)
+    }
+
+    /// 形状集合（图形/图片/文本框/连接线/图表等的增删改查入口）。
+    pub fn shapes(&self) -> Result<Shapes> {
+        Ok(Shapes::from_raw(self.raw.get_obj("Shapes", "Shapes")?))
     }
 
     /// 创建图表。`data_range` 数据区域，`anchor` 左上角锚点单元格。

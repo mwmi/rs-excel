@@ -55,6 +55,43 @@ const FONT_PROPS: &[(&str, &str)] = &[
     ("color", "颜色(#RRGGBB/r,g,b)"),
     ("name", "字体名"),
 ];
+const CHARS_PROPS: &[(&str, &str)] = &[
+    ("text", "替换该段文本"),
+    ("bold", "加粗"),
+    ("italic", "斜体"),
+    ("underline", "下划线"),
+    ("size", "字号"),
+    ("color", "颜色(#RRGGBB/r,g,b)"),
+    ("name", "字体名"),
+];
+const ALIGN_PROPS: &[(&str, &str)] = &[
+    ("h", "水平对齐"),
+    ("v", "垂直对齐"),
+    ("wrap", "自动换行"),
+    ("indent", "缩进级别0-15"),
+    ("orient", "文字方向角度"),
+    ("shrink", "缩小字体填充"),
+];
+const ALIGN_H: &[(&str, &str)] = &[
+    ("left", "左"),
+    ("center", "居中"),
+    ("right", "右"),
+    ("justify", "两端对齐"),
+    ("distributed", "分散对齐"),
+];
+const ALIGN_V: &[(&str, &str)] = &[
+    ("top", "顶"),
+    ("center", "居中"),
+    ("bottom", "底"),
+    ("justify", "两端对齐"),
+    ("distributed", "分散对齐"),
+];
+const SIZE_PROPS: &[(&str, &str)] = &[("w", "列宽"), ("h", "行高"), ("fit", "自适应")];
+const CLEAR_KINDS: &[(&str, &str)] = &[
+    ("contents", "只清内容保留格式(默认)"),
+    ("formats", "只清格式"),
+    ("all", "全部"),
+];
 const BOOL_VALUES: &[(&str, &str)] = &[("true", "真"), ("false", "假")];
 const COLOR_VALUES: &[(&str, &str)] = &[
     ("#FF0000", "红"),
@@ -100,8 +137,8 @@ const WB_MGMT_CMDS: &[&str] = &["list", "use", "new", "open", "save", "saveas", 
 const SHEET_CMDS: &[&str] = &["focus", "sheets", "sheet", "addsheet"];
 /// 已选定工作表时置顶的单元格/页面/VBA 命令。
 const SHEET_CTX_CMDS: &[&str] = &[
-    "info", "get", "set", "tget", "tset", "formula", "fmt", "font", "merge", "unmerge", "chart",
-    "page", "vba",
+    "info", "get", "set", "tget", "tset", "formula", "fmt", "font", "align", "size", "chars",
+    "clear", "find", "replace", "merge", "unmerge", "chart", "page", "vba",
 ];
 
 /// 命令的最低上下文要求：2 = 需选定工作表，1 = 需选定工作簿，0 = 无要求。
@@ -199,6 +236,12 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec { group: G_CELL, name: "formula", desc: "写公式", args: &[ArgSpec::Dynamic(range_candidates, "<地址>"), ArgSpec::Any("公式")] },
     CommandSpec { group: G_CELL, name: "fmt", desc: "数字格式（如 0.00%）", args: &[ArgSpec::Dynamic(range_candidates, "<地址>"), ArgSpec::Fixed(NUM_FORMATS)] },
     CommandSpec { group: G_CELL, name: "font", desc: "字体属性读取/设置", args: &[ArgSpec::Dynamic(range_candidates, "<地址>"), ArgSpec::Fixed(FONT_PROPS), ArgSpec::Ctx(font_value_ctx, "[值]")] },
+    CommandSpec { group: G_CELL, name: "align", desc: "对齐/换行/缩进/方向（无属性=概览）", args: &[ArgSpec::Dynamic(range_candidates, "<地址>"), ArgSpec::Fixed(ALIGN_PROPS), ArgSpec::Ctx(align_value_ctx, "[值]")] },
+    CommandSpec { group: G_CELL, name: "size", desc: "行高/列宽（无参数=概览）", args: &[ArgSpec::Dynamic(range_candidates, "<地址>"), ArgSpec::OptFixed(SIZE_PROPS)] },
+    CommandSpec { group: G_CELL, name: "chars", desc: "部分字符格式/文本（1 基）", args: &[ArgSpec::Dynamic(range_candidates, "<地址>"), ArgSpec::Any("start"), ArgSpec::Any("len"), ArgSpec::Fixed(CHARS_PROPS), ArgSpec::Ctx(chars_value_ctx, "[值]")] },
+    CommandSpec { group: G_CELL, name: "clear", desc: "清除内容/格式（默认 contents）", args: &[ArgSpec::Dynamic(range_candidates, "<地址>"), ArgSpec::OptFixed(CLEAR_KINDS)] },
+    CommandSpec { group: G_CELL, name: "find", desc: "全表查找（包含匹配，输出 地址=值）", args: &[ArgSpec::Any("文本")] },
+    CommandSpec { group: G_CELL, name: "replace", desc: "区域/整表替换", args: &[ArgSpec::Any("区域|all"), ArgSpec::Any("旧文本"), ArgSpec::Any("新文本")] },
     CommandSpec { group: G_CELL, name: "merge", desc: "合并区域", args: &[ArgSpec::Dynamic(range_candidates, "<区域>")] },
     CommandSpec { group: G_CELL, name: "unmerge", desc: "取消合并", args: &[ArgSpec::Dynamic(range_candidates, "<区域>")] },
     CommandSpec { group: G_CELL, name: "chart", desc: "创建图表", args: &[ArgSpec::Fixed(CHART_TYPES), ArgSpec::Any("数据区"), ArgSpec::Any("锚点")] },
@@ -353,22 +396,40 @@ fn range_candidates(st: &mut State) -> Vec<String> {
     }
 }
 
-/// font 第三个参数的候选：由第二个参数（属性名）决定。
-/// bold/italic/underline → true/false；color → 常用色；name → 系统字体列表（整名插入，可含空格）。
-fn font_value_ctx(_st: &mut State, tokens: &[&str]) -> Vec<(String, String)> {
-    match tokens.get(2).copied() {
-        Some("bold") | Some("italic") | Some("underline") => BOOL_VALUES
-            .iter()
-            .map(|(v, d)| (v.to_string(), format!("{v:<10}{d}")))
-            .collect(),
-        Some("color") => COLOR_VALUES
-            .iter()
-            .map(|(v, d)| (v.to_string(), format!("{v:<10}{d}")))
-            .collect(),
-        Some("name") => system_font_names()
+/// 固定候选表 → (插入值, 显示文本) 列表。
+fn list(c: &[(&'static str, &'static str)]) -> Vec<(String, String)> {
+    c.iter().map(|(v, d)| (v.to_string(), format!("{v:<10}{d}"))).collect()
+}
+
+/// 字体属性值候选：bold/italic/underline → 布尔；color → 常用色；name → 系统字体列表。
+fn font_value_list(prop: &str) -> Vec<(String, String)> {
+    match prop {
+        "bold" | "italic" | "underline" => list(BOOL_VALUES),
+        "color" => list(COLOR_VALUES),
+        "name" => system_font_names()
             .into_iter()
             .map(|n| (format!("{n} "), n))
             .collect(),
+        _ => vec![],
+    }
+}
+
+/// font 第三个参数的候选：由第二个参数（属性名）决定。
+fn font_value_ctx(_st: &mut State, tokens: &[&str]) -> Vec<(String, String)> {
+    tokens.get(2).map(|p| font_value_list(p)).unwrap_or_default()
+}
+
+/// chars 第五个参数的候选：由第四个参数（属性名）决定；text 无候选。
+fn chars_value_ctx(_st: &mut State, tokens: &[&str]) -> Vec<(String, String)> {
+    tokens.get(4).map(|p| font_value_list(p)).unwrap_or_default()
+}
+
+/// align 第三个参数的候选：由第二个参数（属性名）决定。
+fn align_value_ctx(_st: &mut State, tokens: &[&str]) -> Vec<(String, String)> {
+    match tokens.get(2).copied() {
+        Some("h") => list(ALIGN_H),
+        Some("v") => list(ALIGN_V),
+        Some("wrap") | Some("shrink") => list(BOOL_VALUES),
         _ => vec![],
     }
 }

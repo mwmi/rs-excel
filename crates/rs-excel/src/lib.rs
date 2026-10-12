@@ -28,7 +28,8 @@
 //!   sheet.raw().call("PageSetup", vec![])?.idispatch()?.put("Zoom", vec![false.into()])?;
 //!   ```
 //! - **联动链路**：`range` → `font()` / `interior()` / `borders()` → 各自属性设置；
-//!   `worksheet.page_setup()` → 页边距/纸张/方向/打印区域/缩放/页眉页脚/打印标题。
+//!   `worksheet.page_setup()` → 页边距/纸张/方向/打印区域/缩放/页眉页脚/打印标题；
+//!   `worksheet.shapes()` → 形状/图片/文本框的增删改查、外观、文本与批量操作。
 //! - **VBA 双通道**：简单操作走内置 API；复杂操作走 `Vba::run_macro`（无需设置）
 //!   或 `Vba::execute`（注入临时模块，需开启信任访问）。
 //! - **颜色格式**：COM 内部为 OLE 格式 `0x00BBGGRR`，统一用 [`rgb`] 助手构造。
@@ -39,6 +40,7 @@ pub mod error;
 pub mod fonts;
 pub mod pagesetup;
 pub mod process;
+pub mod shape;
 
 mod app;
 mod chart;
@@ -59,6 +61,10 @@ pub mod prelude {
     pub use crate::pagesetup::{Margin, Orientation, PageSetup, PaperSize, Section};
     pub use crate::process::{bring_to_front, flash_window, kill, kill_all, processes, restore_if_minimized, ProcessInfo};
     pub use crate::range::{AlignH, AlignV, EndDir, Range, SpecialCells};
+    pub use crate::shape::{
+        type_name, AlignKind, AutoShapeKind, ConnectorKind, DashStyle, DistributeKind, FlipDir,
+        Placement, Shape, ShapeInfo, ShapeRange, Shapes, ZOrderCmd,
+    };
     pub use crate::style::{Borders, Font, Interior};
     pub use crate::vba::{Vba, VbaStatus};
     pub use crate::workbook::{FileFormat, SheetInfo, Workbook, WorkbookInfo};
@@ -76,6 +82,10 @@ pub use fonts::system_font_names;
 pub use pagesetup::{Margin, Orientation, PageSetup, PaperSize, Section};
 pub use process::{bring_to_front, flash_window, kill, kill_all, processes, restore_if_minimized, ProcessInfo};
 pub use range::{AlignH, AlignV, EndDir, Range, SpecialCells};
+pub use shape::{
+    type_name, AlignKind, AutoShapeKind, ConnectorKind, DashStyle, DistributeKind, FlipDir,
+    Placement, Shape, ShapeInfo, ShapeRange, Shapes, ZOrderCmd,
+};
 pub use style::{Borders, Font, Interior};
 pub use vba::{Vba, VbaStatus};
 pub use workbook::{FileFormat, SheetInfo, Workbook, WorkbookInfo};

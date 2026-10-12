@@ -10,7 +10,7 @@ use windows::Win32::System::Variant::{
 };
 
 /// 传给 COM 的参数值。实现了常用类型的 `From`，调用处直接 `"A1".into()` / `123.into()`。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum ComValue {
     Str(String),
     Bool(bool),
@@ -20,6 +20,25 @@ pub enum ComValue {
     Empty,
     /// COM 对象参数（如把 Range 传给 SetSourceData）
     Obj(IDispatch),
+    /// 预构造的 VARIANT（如 SAFEARRAY 数组参数），原样传递
+    Raw(VARIANT),
+}
+
+impl std::fmt::Debug for ComValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Str(s) => write!(f, "Str({s:?})"),
+            Self::Bool(b) => write!(f, "Bool({b})"),
+            Self::Int(i) => write!(f, "Int({i})"),
+            Self::Float(v) => write!(f, "Float({v})"),
+            Self::Empty => write!(f, "Empty"),
+            Self::Obj(_) => write!(f, "Obj(<IDispatch>)"),
+            Self::Raw(v) => {
+                let vt = unsafe { v.Anonymous.Anonymous.vt }.0;
+                write!(f, "Raw(<VARIANT vt=0x{vt:04X}>)")
+            }
+        }
+    }
 }
 
 impl From<&str> for ComValue {
@@ -77,6 +96,7 @@ impl From<ComValue> for VARIANT {
             ComValue::Int(i) => VARIANT::from(i),
             ComValue::Float(f) => VARIANT::from(f),
             ComValue::Empty => VARIANT::default(),
+            ComValue::Raw(v) => v,
             ComValue::Obj(d) => {
                 let mut var = VARIANT::default();
                 unsafe {

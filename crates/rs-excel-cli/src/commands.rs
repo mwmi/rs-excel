@@ -323,7 +323,8 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
             if text.is_empty() {
                 bail!("用法: set <地址> <文本>");
             }
-            st.sheet()?.range(addr.trim())?.set_value(text)?;
+            // 字面 \n 转为换行符，单行输入即可写多段文本（单元格内换行 = vbLf）
+            st.sheet()?.range(addr.trim())?.set_value(text.replace("\\n", "\n"))?;
             println!("已写入 {}（{}）", addr.trim(), text);
         }
         "tget" => {
@@ -370,6 +371,45 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
             println!("已设置 {} 数字格式: {fmt}", addr.trim());
         }
         "font" => font_cmd(st, args)?,
+        "align" => align_cmd(st, args)?,
+        "size" => size_cmd(st, args)?,
+        "chars" => chars_cmd(st, args)?,
+        "clear" => {
+            let (addr, kind) = args
+                .split_once(char::is_whitespace)
+                .map(|(a, k)| (a.trim(), k.trim()))
+                .unwrap_or((args, "contents"));
+            let r = st.sheet()?.range(addr)?;
+            match kind {
+                "contents" => r.clear_contents()?,
+                "formats" => r.clear_formats()?,
+                "all" => r.clear()?,
+                other => bail!("清除类型应为 contents|formats|all（得到 '{other}'，contents=只清内容保留格式）"),
+            }
+            println!("已清除 {addr}（{kind}）");
+        }
+        "find" => {
+            if args.is_empty() {
+                bail!("用法: find <文本>（全表包含匹配）");
+            }
+            match st.sheet()?.find(args)? {
+                Some(r) => println!("{} = {}", r.address()?, r.value()?),
+                None => println!("未找到: {args}"),
+            }
+        }
+        "replace" => {
+            let p: Vec<&str> = args.split_whitespace().collect();
+            if p.len() != 3 {
+                bail!("用法: replace <区域|all> <旧文本> <新文本>");
+            }
+            let r = if p[0] == "all" {
+                st.sheet()?.used_range()?
+            } else {
+                st.sheet()?.range(p[0])?
+            };
+            r.replace(p[1], p[2])?;
+            println!("已替换 {0}: {1} → {2}", p[0], p[1], p[2]);
+        }
         "merge" => {
             st.sheet()?.range(args)?.merge()?;
             println!("已合并 {args}");
@@ -483,8 +523,7 @@ fn font_cmd(st: &State, args: &str) -> Result<()> {
     if p.len() < 2 {
         bail!("用法: font <地址> <bold|italic|underline|size|color|name> [值]（无值=读取）");
     }
-    let r = st.sheet()?.range(p[0])?;
-    let f = r.font()?;
+    let f = st.sheet()?.range(p[0])?.font()?;
     let prop = p[1];
     // 值可含空格（如字体名 "Arial Black"）：属性名之后的所有 token 拼回
     let val = if p.len() > 2 {
@@ -492,25 +531,194 @@ fn font_cmd(st: &State, args: &str) -> Result<()> {
     } else {
         None
     };
-    match (prop, val.as_deref()) {
-        ("bold", Some(v)) => f.set_bold(parse_bool(v)?)?,
-        ("bold", None) => println!("bold = {}", f.bold()?),
-        ("italic", Some(v)) => f.set_italic(parse_bool(v)?)?,
-        ("italic", None) => println!("italic = {}", f.italic()?),
-        ("underline", Some(v)) => f.set_underline(parse_bool(v)?)?,
-        ("underline", None) => println!("underline = {}", f.underline()?),
-        ("size", Some(v)) => f.set_size(v.parse()?)?,
-        ("size", None) => println!("size = {}", f.size()?),
-        ("color", Some(v)) => f.set_color(parse_color(v)?)?,
-        ("color", None) => println!("color = #{:06X}", f.color()?),
-        ("name", Some(v)) => f.set_name(v)?,
-        ("name", None) => println!("name = {}", f.name()?),
-        (other, _) => bail!("未知字体属性 '{other}'，可选 bold|italic|underline|size|color|name"),
-    }
-    if val.is_some() {
-        println!("已设置 {} 字体 {prop}", p[0]);
+    match font_prop(&f, prop, val.as_deref())? {
+        Some(v) => println!("{prop} = {v}"),
+        None => println!("已设置 {} 字体 {prop}", p[0]),
     }
     Ok(())
+}
+
+/// font/chars 共用：读或写字体属性。写返回 None；读返回 Some(显示文本)。
+fn font_prop(f: &Font, prop: &str, val: Option<&str>) -> Result<Option<String>> {
+    match (prop, val) {
+        ("bold", Some(v)) => f.set_bold(parse_bool(v)?).map(|_| None),
+        ("bold", None) => f.bold().map(|b| Some(b.to_string())),
+        ("italic", Some(v)) => f.set_italic(parse_bool(v)?).map(|_| None),
+        ("italic", None) => f.italic().map(|b| Some(b.to_string())),
+        ("underline", Some(v)) => f.set_underline(parse_bool(v)?).map(|_| None),
+        ("underline", None) => f.underline().map(|b| Some(b.to_string())),
+        ("size", Some(v)) => f.set_size(v.parse()?).map(|_| None),
+        ("size", None) => f.size().map(|s| Some(s.to_string())),
+        ("color", Some(v)) => f.set_color(parse_color(v)?).map(|_| None),
+        ("color", None) => f.color().map(|c| Some(format!("#{c:06X}"))),
+        ("name", Some(v)) => f.set_name(v).map(|_| None),
+        ("name", None) => f.name().map(Some),
+        (other, _) => bail!("未知字体属性 '{other}'，可选 bold|italic|underline|size|color|name"),
+    }
+}
+
+/// 对齐命令：无属性=概览，属性读写双模式。
+fn align_cmd(st: &State, args: &str) -> Result<()> {
+    let p: Vec<&str> = args.split_whitespace().collect();
+    if p.is_empty() {
+        bail!("用法: align <地址> [h|v|wrap|indent|orient|shrink] [值]（无属性=概览）");
+    }
+    let r = st.sheet()?.range(p[0])?;
+    if p.len() == 1 {
+        println!(
+            "h={}  v={}  wrap={}  indent={}  orient={}  shrink={}",
+            align_name(r.h_align()?),
+            align_name(r.v_align()?),
+            onoff(r.wrap_text()?),
+            r.indent()?,
+            r.orientation()?,
+            onoff(r.shrink()?)
+        );
+        return Ok(());
+    }
+    let prop = p[1];
+    let val = p.get(2..).map(|s| s.join(" "));
+    match (prop, val.as_deref()) {
+        ("h", Some(v)) => r.set_alignment(Some(parse_h(v)?), None, None)?,
+        ("v", Some(v)) => r.set_alignment(None, Some(parse_v(v)?), None)?,
+        ("wrap", Some(v)) => r.set_alignment(None, None, Some(parse_bool(v)?))?,
+        ("indent", Some(v)) => r.set_indent(v.parse().map_err(|_| anyhow::anyhow!("缩进级别应为 0~15 的整数（得到 '{v}'）"))?)?,
+        ("orient", Some(v)) => r.set_orientation(parse_orient(v)?)?,
+        ("shrink", Some(v)) => r.set_shrink(parse_bool(v)?)?,
+        ("h" | "v" | "wrap" | "indent" | "orient" | "shrink", None) => {
+            bail!("属性 '{prop}' 需要一个值（如 align {0} {1} left）", p[0], prop)
+        }
+        (other, _) => bail!("未知属性 '{other}'，可选 h|v|wrap|indent|orient|shrink"),
+    }
+    println!("已设置 {} {prop}", p[0]);
+    Ok(())
+}
+
+/// 行高/列宽命令：无参数=概览。
+fn size_cmd(st: &State, args: &str) -> Result<()> {
+    let p: Vec<&str> = args.split_whitespace().collect();
+    if p.is_empty() {
+        bail!("用法: size <地址> [w|h|fit] [值]（无参数=概览；w=列宽 h=行高 fit=自适应）");
+    }
+    let r = st.sheet()?.range(p[0])?;
+    match p.get(1).copied() {
+        None => println!("列宽={}  行高={}", r.col_width()?, r.row_height()?),
+        Some("fit") => {
+            r.auto_fit()?;
+            println!("已自适应 {}（列宽/行高）", p[0]);
+        }
+        Some("w") => {
+            let w: f64 = p.get(2)
+                .ok_or_else(|| anyhow::anyhow!("用法: size {} w <列宽>", p[0]))?
+                .parse()
+                .map_err(|_| anyhow::anyhow!("列宽应为数字（单位：字符）"))?;
+            r.set_col_width(w)?;
+            println!("已设置 {} 列宽: {w}", p[0]);
+        }
+        Some("h") => {
+            let h: f64 = p.get(2)
+                .ok_or_else(|| anyhow::anyhow!("用法: size {} h <行高>", p[0]))?
+                .parse()
+                .map_err(|_| anyhow::anyhow!("行高应为数字（单位：磅）"))?;
+            r.set_row_height(h)?;
+            println!("已设置 {} 行高: {h}", p[0]);
+        }
+        Some(other) => bail!("未知属性 '{other}'，可选 w|h|fit"),
+    }
+    Ok(())
+}
+
+/// 部分字符命令（单元格内按字符范围局部格式化，1 基）。
+fn chars_cmd(st: &State, args: &str) -> Result<()> {
+    let p: Vec<&str> = args.split_whitespace().collect();
+    if p.len() < 3 {
+        bail!("用法: chars <地址> <start> <len> [bold|italic|underline|size|color|name|text] [值]（无属性=概览）");
+    }
+    let r = st.sheet()?.range(p[0])?;
+    let pos = |s: &str| -> Result<i32> {
+        s.parse()
+            .map_err(|_| anyhow::anyhow!("start/len 为 1 基字符位置，须为 ≥1 的整数（得到 '{s}'）"))
+    };
+    let (start, len) = (pos(p[1])?, pos(p[2])?);
+    let prop = p.get(3).copied();
+    let val = p.get(4..).map(|s| s.join(" "));
+    match (prop, val.as_deref()) {
+        (None, _) => {
+            // 一次读全：部分文本 + 字体概览，省 token
+            let f = r.char_font(start, len)?;
+            println!(
+                "文本 = {}  字体 = {},{},{}",
+                r.char_text(start, len)?,
+                f.name().unwrap_or_default(),
+                f.size().map(|s| s.to_string()).unwrap_or_default(),
+                if f.bold().unwrap_or(false) { "粗" } else { "常规" }
+            );
+        }
+        (Some("text"), Some(v)) => {
+            r.set_char_text(start, len, &v.replace("\\n", "\n"))?;
+            println!("已替换 {} 第{start}起{len}字符", p[0]);
+        }
+        (Some("text"), None) => println!("text = {}", r.char_text(start, len)?),
+        (Some(prop), v) => match font_prop(&r.char_font(start, len)?, prop, v)? {
+            Some(s) => println!("{prop} = {s}"),
+            None => println!("已设置 {} 第{start}起{len}字符 {prop}", p[0]),
+        },
+    }
+    Ok(())
+}
+
+/// xlHAlign/xlVAlign 数值 → 名称（未知值显示数字）。
+fn align_name(v: i32) -> String {
+    match v {
+        -4131 => "left".into(),
+        -4108 => "center".into(),
+        -4152 => "right".into(),
+        -4160 => "top".into(),
+        -4107 => "bottom".into(),
+        -4130 => "justify".into(),
+        -4117 => "distributed".into(),
+        1 => "general".into(),
+        _ => v.to_string(),
+    }
+}
+
+fn parse_h(s: &str) -> Result<AlignH> {
+    match s {
+        "left" => Ok(AlignH::Left),
+        "center" => Ok(AlignH::Center),
+        "right" => Ok(AlignH::Right),
+        "justify" => Ok(AlignH::Justify),
+        "distributed" => Ok(AlignH::Distributed),
+        other => bail!("水平对齐应为 left|center|right|justify|distributed（得到 '{other}'）"),
+    }
+}
+
+fn parse_v(s: &str) -> Result<AlignV> {
+    match s {
+        "top" => Ok(AlignV::Top),
+        "center" => Ok(AlignV::Center),
+        "bottom" => Ok(AlignV::Bottom),
+        "justify" => Ok(AlignV::Justify),
+        "distributed" => Ok(AlignV::Distributed),
+        other => bail!("垂直对齐应为 top|center|bottom|justify|distributed（得到 '{other}'）"),
+    }
+}
+
+fn parse_orient(s: &str) -> Result<i32> {
+    if s == "vertical" {
+        return Ok(-4166); // xlVertical 竖排
+    }
+    let d: i32 = s
+        .parse()
+        .map_err(|_| anyhow::anyhow!("方向应为 -90~90 角度或 vertical（得到 '{s}'）"))?;
+    if !(-90..=90).contains(&d) {
+        bail!("角度范围 -90~90（得到 '{d}'）");
+    }
+    Ok(d)
+}
+
+fn onoff(b: bool) -> &'static str {
+    if b { "开" } else { "关" }
 }
 
 /// 页面设置命令：无参数查看概览，子命令修改（margins/paper/orient/area/zoom/fit/header/footer/titles）。
