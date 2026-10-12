@@ -86,6 +86,80 @@ pub fn pid_of_hwnd(hwnd: i32) -> Result<u32> {
     Ok(pid)
 }
 
+/// 内部句柄 → 所属顶层窗口（WPS 的 `Application.Hwnd` 常指向内部子窗口，直接操作它无效）。
+fn top_level(hwnd: i32) -> i32 {
+    use windows::Win32::UI::WindowsAndMessaging::{GA_ROOTOWNER, GetAncestor};
+    unsafe {
+        let root = GetAncestor(HWND(hwnd as u32 as usize as *mut _), GA_ROOTOWNER);
+        let v = root.0 as usize as i32;
+        if v == 0 { hwnd } else { v }
+    }
+}
+
+/// 任务栏图标闪烁提示（持续到窗口被激活，用户不切走也能看到高亮）。
+pub fn flash_window(hwnd: i32) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG, FlashWindowEx,
+    };
+    let mut info = FLASHWINFO {
+        cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+        hwnd: HWND(top_level(hwnd) as u32 as usize as *mut _),
+        dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+        uCount: 0,
+        dwTimeout: 0,
+    };
+    unsafe {
+        let _ = FlashWindowEx(&mut info);
+    }
+}
+
+/// 若窗口最小化则还原（SW_RESTORE），返回是否执行了还原。
+///
+/// WPS 不接受 COM 写 `WindowState`（0x80020009），最小化还原必须走 Win32。
+pub fn restore_if_minimized(hwnd: i32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{SW_RESTORE, IsIconic, ShowWindow};
+    unsafe {
+        let h = HWND(top_level(hwnd) as u32 as usize as *mut _);
+        if IsIconic(h).as_bool() {
+            let _ = ShowWindow(h, SW_RESTORE);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Win32 直接设置窗口状态（COM 写 `WindowState` 被 WPS 拒绝时的回退）。
+pub fn show_window(hwnd: i32, st: crate::app::WindowState) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWNORMAL, ShowWindow,
+    };
+    let cmd = match st {
+        crate::app::WindowState::Maximized => SW_MAXIMIZE,
+        crate::app::WindowState::Minimized => SW_MINIMIZE,
+        crate::app::WindowState::Normal => SW_SHOWNORMAL,
+    };
+    unsafe { ShowWindow(HWND(top_level(hwnd) as u32 as usize as *mut _), cmd).as_bool() }
+}
+
+/// 将窗口强制提到前台最顶层（WPS 的 Activate 不一定抢得到前台焦点）。
+///
+/// REPL 进程不在前台，`SetForegroundWindow` 会被系统前台锁拒绝；
+/// 先 TOPMOST 再 NOTOPMOST 可绕过锁把窗口抬到最高层，最后再尝试补一次焦点。
+pub fn bring_to_front(hwnd: i32) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HWND_NOTOPMOST, HWND_TOPMOST, SetForegroundWindow, SetWindowPos, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_SHOWWINDOW,
+    };
+    unsafe {
+        let h = HWND(top_level(hwnd) as u32 as usize as *mut _);
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW;
+        let _ = SetWindowPos(h, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
+        let _ = SetWindowPos(h, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags);
+        let _ = SetForegroundWindow(h);
+    }
+}
+
 /// 进程的可执行文件名（小写，如 "et.exe"）。
 pub fn exe_name_of(pid: u32) -> Result<String> {
     unsafe {

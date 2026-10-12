@@ -176,6 +176,9 @@ impl Workbook {
     }
 
     /// 另存为（绝对路径 + 格式）。
+    ///
+    /// 注意：目标文件已存在时会弹覆盖确认框（WPS 该弹窗不响应 DisplayAlerts）；
+    /// 需免弹窗覆盖的场景由调用方先行删除目标文件。
     pub fn save_as(&self, path: &str, format: FileFormat) -> Result<()> {
         self.raw
             .call("SaveAs", vec![path.into(), (format as i32).into()])
@@ -219,6 +222,6 @@ impl Workbook {
         self.raw
             .call("SaveCopyAs", vec![path.into()])
             .map(|_| ())
-            .map_err(|e| ExcelError::hint(e, "路径需为绝对路径；相对路径可用 app 侧工具先转绝对"))
+            .map_err(|e| ExcelError::hint(e, "路径需为绝对路径；确认目录存在且文件未被独占锁定"))
     }
 }

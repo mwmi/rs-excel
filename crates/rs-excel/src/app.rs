@@ -17,7 +17,7 @@ use crate::com::{sel_arg, sel_index};
 use crate::com::variant::{CellValue, ComValue};
 use crate::engine::{ComApartment, ConnectMode, Engine};
 use crate::error::ExcelError;
-use crate::process::{exe_name_of, pid_of_hwnd};
+use crate::process::{exe_name_of, pid_of_hwnd, show_window};
 use crate::range::Range;
 use crate::worksheet::Worksheet;
 use crate::workbook::{Workbook, WorkbookInfo};
@@ -131,6 +131,11 @@ impl App {
     /// 关闭弹窗告警（SaveAs 遇同名文件等不再卡模态框）。
     pub fn set_display_alerts(&self, on: bool) -> Result<()> {
         self.raw.put("DisplayAlerts", vec![on.into()])
+    }
+
+    /// 是否弹窗告警（WPS 可能以布尔或整型返回，`bool()` 均可解析）。
+    pub fn display_alerts(&self) -> Result<bool> {
+        self.raw.get("DisplayAlerts")?.bool()
     }
 
     pub fn set_screen_updating(&self, on: bool) -> Result<()> {
@@ -251,7 +256,18 @@ impl App {
     }
 
     pub fn set_window_state(&self, st: WindowState) -> Result<()> {
-        self.raw.put("WindowState", vec![st.code().into()])
+        // WPS 拒绝 COM 写 xlNormal/xlMinimized（0x80020009，xlMaximized 可用），失败时回退 Win32
+        match self.raw.put("WindowState", vec![st.code().into()]) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let hwnd = self.raw.get("Hwnd").and_then(|v| v.int())?;
+                if show_window(hwnd, st) {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// 当前窗口状态（xlMaximized / xlMinimized / xlNormal）。

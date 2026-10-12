@@ -57,7 +57,7 @@ pub mod prelude {
     pub use crate::error::{rgb, ExcelError};
     pub use crate::fonts::system_font_names;
     pub use crate::pagesetup::{Margin, Orientation, PageSetup, PaperSize, Section};
-    pub use crate::process::{kill, kill_all, processes, ProcessInfo};
+    pub use crate::process::{bring_to_front, flash_window, kill, kill_all, processes, restore_if_minimized, ProcessInfo};
     pub use crate::range::{AlignH, AlignV, EndDir, Range, SpecialCells};
     pub use crate::style::{Borders, Font, Interior};
     pub use crate::vba::{Vba, VbaStatus};
@@ -74,7 +74,7 @@ pub use engine::{ConnectMode, Engine};
 pub use error::{rgb, ExcelError};
 pub use fonts::system_font_names;
 pub use pagesetup::{Margin, Orientation, PageSetup, PaperSize, Section};
-pub use process::{kill, kill_all, processes, ProcessInfo};
+pub use process::{bring_to_front, flash_window, kill, kill_all, processes, restore_if_minimized, ProcessInfo};
 pub use range::{AlignH, AlignV, EndDir, Range, SpecialCells};
 pub use style::{Borders, Font, Interior};
 pub use vba::{Vba, VbaStatus};

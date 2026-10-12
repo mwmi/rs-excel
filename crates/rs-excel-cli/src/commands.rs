@@ -181,6 +181,19 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
             st.set_wb(wb)?;
             println!("已选定工作簿: {}", st.wb_label);
         }
+        "focus" => {
+            // 闪烁必须在窗口激活前调用：窗口一旦置前，系统会抑制任务栏闪烁
+            let app_hwnd = st.app()?.raw().get("Hwnd").and_then(|v| v.int()).ok();
+            if let Some(h) = app_hwnd {
+                flash_window(h);
+                restore_if_minimized(h);
+            }
+            st.wb()?.activate()?;
+            if let Some(h) = app_hwnd {
+                bring_to_front(h);
+            }
+            println!("▶ 当前控制: {}（已置前激活，任务栏闪烁提示）", st.wb_label);
+        }
         "new" => {
             let wb = st.app()?.new_workbook()?;
             st.set_wb(wb)?;
@@ -228,19 +241,10 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
             println!("已关闭工作簿（保存: {}）", if save { "是" } else { "否" });
         }
         "appquit" => {
-            let app = st.app()?;
-            // Quit 阻塞至"是否保存"弹窗被处理后才返回：
-            // 返回后应用仍在（连接可访问）即退出被取消，否则已断开
-            app.quit()?;
-            if app.caption().is_ok() {
-                println!(
-                    "退出被取消：未保存文档弹窗选择了取消，连接保持。可先 save/close 再重试，或 alerts off 后 appquit 跳过弹窗"
-                );
-            } else {
-                st.clear_wb();
-                st.app = None;
-                println!("应用已退出，连接已断开");
-            }
+            st.app()?.quit()?;
+            st.clear_wb();
+            st.app = None;
+            println!("已退出应用，连接已断开");
         }
         "sheets" => {
             let sheets = st.wb()?.sheets()?;
@@ -280,11 +284,19 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
                 app.caption().unwrap_or_default()
             );
             let wb = st.wb()?;
+            // COM 的 Saved 只表示"无未保存改动"：新建未落盘的工作簿也是 true，
+            // 以 FullName 是否含路径区分"从未保存到磁盘"与"有未保存改动"
+            let full = wb.full_name().unwrap_or_default();
+            let saved_disp = if !wb.is_saved().unwrap_or(false) {
+                "否（有未保存改动）"
+            } else if full.is_empty() || full == st.wb_label {
+                "否（从未保存到磁盘）"
+            } else {
+                "是"
+            };
             println!(
                 "工作簿: {}  完整路径: {}  已保存: {}",
-                st.wb_label,
-                wb.full_name().unwrap_or_default(),
-                if wb.is_saved().unwrap_or(false) { "是" } else { "否" }
+                st.wb_label, full, saved_disp
             );
             let sh = st.sheet()?;
             println!(
@@ -410,6 +422,10 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
             other => bail!("用法: visible on|off（得到 '{other}'）"),
         },
         "alerts" => match args {
+            "" => {
+                let on = st.app()?.display_alerts()?;
+                println!("弹窗告警: {}（alerts on|off 修改）", if on { "开" } else { "关" });
+            }
             "on" => {
                 st.app()?.set_display_alerts(true)?;
                 println!("已开启弹窗告警");
@@ -418,7 +434,7 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
                 st.app()?.set_display_alerts(false)?;
                 println!("已关闭弹窗告警");
             }
-            other => bail!("用法: alerts on|off（得到 '{other}'）"),
+            other => bail!("用法: alerts [on|off]，无参数查看当前状态（得到 '{other}'）"),
         },
         "state" => {
             if args.is_empty() {

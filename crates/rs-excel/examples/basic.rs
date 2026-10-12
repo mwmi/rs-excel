@@ -57,8 +57,9 @@ fn main() -> Result<()> {
         if st.trust_access { "已开启" } else { "未开启" }
     );
 
-    // 8. 保存并关闭
+    // 8. 保存并关闭（WPS 覆盖确认框不响应 DisplayAlerts，演示需无人值守 → 调用方先删旧文件）
     let out = std::env::current_dir()?.join("rs_excel_demo.xlsx");
+    let _ = std::fs::remove_file(&out);
     wb.save_as(&out.to_string_lossy(), FileFormat::Xlsx)?;
     println!("已保存: {}", out.display());
     wb.close(false)?;

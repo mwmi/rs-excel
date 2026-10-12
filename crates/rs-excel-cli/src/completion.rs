@@ -97,7 +97,7 @@ const WINDOW_STATES: &[(&str, &str)] = &[("max", "最大化"), ("min", "最小�
 /// 未选定工作簿时置顶的工作簿管理命令（save/saveas/pdf/close 因需要工作簿而被隐藏）。
 const WB_MGMT_CMDS: &[&str] = &["list", "use", "new", "open", "save", "saveas", "pdf", "close"];
 /// 已选定工作簿时置顶的工作表命令。
-const SHEET_CMDS: &[&str] = &["sheets", "sheet", "addsheet"];
+const SHEET_CMDS: &[&str] = &["focus", "sheets", "sheet", "addsheet"];
 /// 已选定工作表时置顶的单元格/页面/VBA 命令。
 const SHEET_CTX_CMDS: &[&str] = &[
     "info", "get", "set", "tget", "tset", "formula", "fmt", "font", "merge", "unmerge", "chart",
@@ -179,6 +179,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     // 工作簿
     CommandSpec { group: G_WB, name: "list", desc: "列出打开的工作簿（未连接自动接管应用）", args: &[] },
     CommandSpec { group: G_WB, name: "use", desc: "选定当前工作簿", args: &[ArgSpec::Dynamic(workbook_candidates, "<序号|名称>")] },
+    CommandSpec { group: G_WB, name: "focus", desc: "还原最小化窗口并置前激活当前工作簿，任务栏闪烁提示", args: &[] },
     CommandSpec { group: G_WB, name: "new", desc: "新建工作簿并选定", args: &[] },
     CommandSpec { group: G_WB, name: "open", desc: "打开工作簿并选定", args: &[ArgSpec::Path] },
     CommandSpec { group: G_WB, name: "save", desc: "保存当前工作簿", args: &[] },
@@ -226,7 +227,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec { group: G_WIN, name: "wins", desc: "列出窗口", args: &[] },
     CommandSpec { group: G_WIN, name: "win", desc: "激活窗口", args: &[ArgSpec::Dynamic(window_candidates, "<窗口序号|标题>")] },
     CommandSpec { group: G_WIN, name: "visible", desc: "显示/隐藏应用窗口", args: &[ArgSpec::Fixed(ON_OFF)] },
-    CommandSpec { group: G_WIN, name: "alerts", desc: "开关弹窗告警", args: &[ArgSpec::Fixed(ON_OFF)] },
+    CommandSpec { group: G_WIN, name: "alerts", desc: "弹窗告警：无参数查看，on|off 开关", args: &[ArgSpec::OptFixed(ON_OFF)] },
     CommandSpec { group: G_WIN, name: "state", desc: "查看/设置窗口状态（无参数=查看）", args: &[ArgSpec::OptFixed(WINDOW_STATES)] },
     // 扩展
     CommandSpec { group: G_EXT, name: "raw", desc: "直接调用 COM 成员（测试未封装 API）", args: &[ArgSpec::Fixed(RAW_KINDS), ArgSpec::Any("成员"), ArgSpec::OptAny("参数")] },
