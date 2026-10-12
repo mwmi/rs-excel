@@ -14,9 +14,12 @@ use windows::Win32::System::Ole::GetActiveObject;
 
 use crate::com::dispatch::IDispatchWrapper;
 use crate::com::{sel_arg, sel_index};
+use crate::com::variant::{CellValue, ComValue};
 use crate::engine::{ComApartment, ConnectMode, Engine};
 use crate::error::ExcelError;
 use crate::process::{exe_name_of, pid_of_hwnd};
+use crate::range::Range;
+use crate::worksheet::Worksheet;
 use crate::workbook::{Workbook, WorkbookInfo};
 
 /// 应用窗口状态。
@@ -25,6 +28,13 @@ pub enum WindowState {
     Maximized,
     Minimized,
     Normal,
+}
+
+/// 计算模式（xlCalculation 常量）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalcMode {
+    Automatic = -4105,
+    Manual = -4135,
 }
 
 impl WindowState {
@@ -125,6 +135,119 @@ impl App {
 
     pub fn set_screen_updating(&self, on: bool) -> Result<()> {
         self.raw.put("ScreenUpdating", vec![on.into()])
+    }
+
+    pub fn screen_updating(&self) -> Result<bool> {
+        self.raw.get("ScreenUpdating")?.bool()
+    }
+
+    /// 开关事件响应（批量写入前关闭可提速，并防止事件递归）。
+    pub fn enable_events(&self, on: bool) -> Result<()> {
+        self.raw.put("EnableEvents", vec![on.into()])
+    }
+
+    /// 当前计算模式。
+    pub fn calculation(&self) -> Result<CalcMode> {
+        Ok(match self.raw.get("Calculation")?.int()? {
+            -4135 => CalcMode::Manual,
+            _ => CalcMode::Automatic,
+        })
+    }
+
+    /// 设置计算模式。批量写公式前可切 Manual，结束切回 Automatic。
+    pub fn set_calculation(&self, mode: CalcMode) -> Result<()> {
+        self.raw.put("Calculation", vec![(mode as i32).into()])
+    }
+
+    /// 状态栏提示文字。
+    pub fn set_status_bar(&self, text: &str) -> Result<()> {
+        self.raw.put("StatusBar", vec![text.into()])
+    }
+
+    /// 恢复状态栏默认显示。
+    pub fn clear_status_bar(&self) -> Result<()> {
+        self.raw.put("StatusBar", vec![false.into()])
+    }
+
+    /// ★ 四合一批量模式开关。
+    ///
+    /// - `on=true`：关屏幕刷新 + 关事件 + 关弹窗 + 手动计算（批量操作前提速）；
+    /// - `on=false`：全部恢复默认（刷新/事件/弹窗开启，自动计算）。
+    ///
+    /// 用法：批量操作前 `set_fast(true)`，结束 `set_fast(false)`。
+    pub fn set_fast(&self, on: bool) -> Result<()> {
+        self.raw.put("ScreenUpdating", vec![(!on).into()])?;
+        self.raw.put("EnableEvents", vec![(!on).into()])?;
+        self.raw.put("DisplayAlerts", vec![(!on).into()])?;
+        self.raw.put(
+            "Calculation",
+            vec![(if on { CalcMode::Manual } else { CalcMode::Automatic } as i32).into()],
+        )
+    }
+
+    /// 清除剪贴板复制状态（复制/粘贴后调用）。
+    pub fn cut_copy_mode_off(&self) -> Result<()> {
+        self.raw.put("CutCopyMode", vec![false.into()])
+    }
+
+    /// 重算所有打开的工作簿。
+    pub fn calculate(&self) -> Result<()> {
+        self.raw.call("Calculate", vec![]).map(|_| ())
+    }
+
+    /// ★ 计算工作表表达式，一个入口覆盖全部工作表函数：
+    /// `evaluate("SUM(A1:A10)")` / `evaluate("VLOOKUP(...)")` / `evaluate("MATCH(...)")`。
+    pub fn evaluate(&self, expr: &str) -> Result<CellValue> {
+        Ok(self.raw.call("Evaluate", vec![expr.into()])?.value())
+    }
+
+    /// 合并两个区域为多区域（联合）。
+    pub fn union(&self, a: &Range, b: &Range) -> Result<Range> {
+        Ok(Range::from_raw(
+            self.raw
+                .call(
+                    "Union",
+                    vec![
+                        ComValue::Obj(a.raw().disp.clone()),
+                        ComValue::Obj(b.raw().disp.clone()),
+                    ],
+                )?
+                .idispatch()?,
+        ))
+    }
+
+    /// 两个区域的交集。无交集返回 `Ok(None)`，不报错。
+    pub fn intersect(&self, a: &Range, b: &Range) -> Result<Option<Range>> {
+        let v = self.raw.call(
+            "Intersect",
+            vec![
+                ComValue::Obj(a.raw().disp.clone()),
+                ComValue::Obj(b.raw().disp.clone()),
+            ],
+        )?;
+        if v.is_object() {
+            Ok(Some(Range::from_raw(v.idispatch()?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// 阻塞等待 `seconds` 秒（期间应用无响应，慎用长等待）。
+    pub fn wait(&self, seconds: f64) -> Result<()> {
+        let now = self.raw.get("Now")?.float()?;
+        // Wait 接收时间序列值，1 天 = 1.0
+        self.raw.call("Wait", vec![(now + seconds / 86400.0).into()])
+            .map(|_| ())
+    }
+
+    /// 应用版本号（如 "16.0"）。
+    pub fn version(&self) -> Result<String> {
+        self.raw.get("Version")?.string()
+    }
+
+    /// 当前用户名。
+    pub fn user_name(&self) -> Result<String> {
+        self.raw.get("UserName")?.string()
     }
 
     pub fn set_window_state(&self, st: WindowState) -> Result<()> {
@@ -244,6 +367,34 @@ impl App {
     pub fn active_workbook(&self) -> Result<Workbook> {
         Ok(Workbook::from_raw(
             self.raw.get_obj("ActiveWorkbook", "ActiveWorkbook")?,
+        ))
+    }
+
+    /// 代码所在工作簿（COM 服务进程视角，等价 VBA ThisWorkbook）。
+    pub fn this_workbook(&self) -> Result<Workbook> {
+        Ok(Workbook::from_raw(
+            self.raw.get_obj("ThisWorkbook", "ThisWorkbook")?,
+        ))
+    }
+
+    /// 当前活动工作表。
+    pub fn active_sheet(&self) -> Result<Worksheet> {
+        Ok(Worksheet::from_raw(
+            self.raw.get_obj("ActiveSheet", "ActiveSheet")?,
+        ))
+    }
+
+    /// 当前活动单元格。
+    pub fn active_cell(&self) -> Result<Range> {
+        Ok(Range::from_raw(
+            self.raw.get_obj("ActiveCell", "ActiveCell")?,
+        ))
+    }
+
+    /// 当前选中区域（可能是图表等非区域对象，此时后续操作会报错）。
+    pub fn selection(&self) -> Result<Range> {
+        Ok(Range::from_raw(
+            self.raw.get_obj("Selection", "Selection")?,
         ))
     }
 

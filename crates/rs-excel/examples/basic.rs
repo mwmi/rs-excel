@@ -37,6 +37,13 @@ fn main() -> Result<()> {
     // 5. 区域批量读（TSV）
     println!("A1:B4 内容:\n{}", sheet.read_tsv("A1:B4")?);
 
+    // 5.5 批量模式 + UsedRange + evaluate（工作表函数统一入口）
+    app.set_fast(true)?;
+    println!("已用区域: {}", sheet.used_addr()?);
+    let total = app.evaluate("SUM(B2:B4)")?;
+    println!("evaluate SUM(B2:B4) = {total}");
+    app.set_fast(false)?;
+
     // 6. 图表
     let chart = sheet.add_chart(ChartKind::Column, "A1:B4", "D2")?;
     chart.set_title("水果数量")?;

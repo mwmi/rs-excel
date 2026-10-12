@@ -103,6 +103,11 @@ impl Worksheet {
         Ok(Range::from_raw(r.deeper(&addr)))
     }
 
+    /// 已使用区域地址（如 `A1:F23`），判断数据范围的首选（一次 COM 调用）。
+    pub fn used_addr(&self) -> Result<String> {
+        self.used_range()?.address()
+    }
+
     /// 已使用区域的行数。
     pub fn rows(&self) -> Result<i32> {
         self.used_range()?.rows()
@@ -111,6 +116,74 @@ impl Worksheet {
     /// 已使用区域的列数。
     pub fn columns(&self) -> Result<i32> {
         self.used_range()?.columns()
+    }
+
+    /// 在第 `at` 行前插入 `count` 行。
+    pub fn insert_rows(&self, at: i32, count: i32) -> Result<()> {
+        self.range(&row_block(at, count)?)?.insert(true)
+    }
+
+    /// 删除第 `at` 行起的 `count` 行。
+    pub fn delete_rows(&self, at: i32, count: i32) -> Result<()> {
+        self.range(&row_block(at, count)?)?.delete(true)
+    }
+
+    /// 在第 `at` 列前插入 `count` 列。
+    pub fn insert_cols(&self, at: i32, count: i32) -> Result<()> {
+        self.range(&col_block(at, count)?)?.insert(false)
+    }
+
+    /// 删除第 `at` 列起的 `count` 列。
+    pub fn delete_cols(&self, at: i32, count: i32) -> Result<()> {
+        self.range(&col_block(at, count)?)?.delete(false)
+    }
+
+    /// 保护工作表（内容不可编辑）。
+    pub fn protect(&self, password: &str) -> Result<()> {
+        self.raw
+            .call_named(
+                "Protect",
+                vec![],
+                &[("Password", password.into()), ("Contents", true.into())],
+            )
+            .map(|_| ())
+    }
+
+    /// 取消保护。
+    pub fn unprotect(&self, password: &str) -> Result<()> {
+        self.raw.call("Unprotect", vec![password.into()]).map(|_| ())
+    }
+
+    /// 全表查找（在已使用区域内包含匹配）。未找到返回 `Ok(None)`，不报错。
+    pub fn find(&self, what: &str) -> Result<Option<Range>> {
+        self.used_range()?.find(what, false)
+    }
+
+    /// 复制本表为副本：`after=None` 放到末尾，`Some(锚表名)` 放到该表之后。返回新表。
+    pub fn copy_sheet(&self, after: Option<&str>) -> Result<Worksheet> {
+        let wb = self.raw.get("Parent")?.idispatch()?;
+        let anchor = match after {
+            Some(name) => wb
+                .call("Worksheets", vec![name.into()])?
+                .idispatch()
+                .map_err(|e| ExcelError::hint(e, "锚点工作表名不存在：先用 sheets() 列出"))?,
+            None => {
+                let sheets = wb.get_obj("Worksheets", "Worksheets")?;
+                let count = sheets.get("Count")?.int()?;
+                sheets.call("Item", vec![count.into()])?.idispatch()?
+            }
+        };
+        self.raw
+            .call_named("Copy", vec![], &[("After", ComValue::Obj(anchor.disp.clone()))])?;
+        // Copy 不返回新表，新表复制后成为活动表
+        let new_ws = self.raw.get("Application")?.idispatch()?.get_obj("ActiveSheet", "ActiveSheet")?;
+        let name = new_ws.get("Name")?.string().unwrap_or_default();
+        Ok(Worksheet::from_raw(new_ws.deeper(&name)))
+    }
+
+    /// 重算本表。
+    pub fn calculate(&self) -> Result<()> {
+        self.raw.call("Calculate", vec![]).map(|_| ())
     }
 
     /// 页面设置（页边距/纸张/方向/打印区域/缩放/页眉页脚/打印标题）。
@@ -192,6 +265,30 @@ impl Worksheet {
         }
         Ok(crate::chart::Chart::from_raw(chart))
     }
+}
+
+/// 行区间地址，如 (5, 3) → "5:7"。
+fn row_block(at: i32, count: i32) -> Result<String> {
+    if at < 1 || count < 1 {
+        return Err(ExcelError::new("row_block", "", "行列号须 ≥ 1")
+            .with_hint("行号从 1 开始，count 至少为 1")
+            .into());
+    }
+    Ok(if count == 1 {
+        format!("{at}:{at}")
+    } else {
+        format!("{at}:{}", at + count - 1)
+    })
+}
+
+/// 列区间地址，如 (2, 3) → "B:D"。
+fn col_block(at: i32, count: i32) -> Result<String> {
+    if at < 1 || count < 1 {
+        return Err(ExcelError::new("col_block", "", "行列号须 ≥ 1")
+            .with_hint("列号从 1（A 列）开始，count 至少为 1")
+            .into());
+    }
+    Ok(format!("{}:{}", num_to_col(at), num_to_col(at + count - 1)))
 }
 
 /// 解析单元格地址（如 "A1"、"$B$12"）→ (列号, 行号)，1 基。

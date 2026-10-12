@@ -20,6 +20,9 @@
 //! - **AI 友好**：所有错误为单行结构化格式
 //!   `[操作] @ 对象路径 | 底层原因 | 提示: 修复建议`，一次读取即可定位。
 //! - **批量读写**：`write_tsv` / `read_tsv` 一段文本搞定整块区域，最省 token。
+//! - **最快路径默认**：值/公式读写默认走 `Value2` / `Formula2`（日期返回序列值）；
+//!   旧 `Value` / `Formula` 语义（日期转可读文本）用 `_compat` 后缀方法访问。
+//! - **批量提速**：批量操作前 `app.set_fast(true)`（四合一批量模式），结束 `set_fast(false)` 恢复。
 //! - **扩展性**：库未封装的 COM 成员用 `.raw().get/call/call_named/put` 一行直调：
 //!   ```no_run
 //!   sheet.raw().call("PageSetup", vec![])?.idispatch()?.put("Zoom", vec![false.into()])?;
@@ -33,6 +36,7 @@
 pub mod com;
 pub mod engine;
 pub mod error;
+pub mod fonts;
 pub mod pagesetup;
 pub mod process;
 
@@ -45,15 +49,16 @@ mod workbook;
 mod worksheet;
 
 pub mod prelude {
-    pub use crate::app::{App, WindowInfo, WindowState};
+    pub use crate::app::{App, CalcMode, WindowInfo, WindowState};
     pub use crate::chart::{Chart, ChartKind};
     pub use crate::com::dispatch::IDispatchWrapper;
     pub use crate::com::variant::{CellValue, ComValue};
     pub use crate::engine::{ConnectMode, Engine};
     pub use crate::error::{rgb, ExcelError};
+    pub use crate::fonts::system_font_names;
     pub use crate::pagesetup::{Margin, Orientation, PageSetup, PaperSize, Section};
     pub use crate::process::{kill, kill_all, processes, ProcessInfo};
-    pub use crate::range::{AlignH, AlignV, Range};
+    pub use crate::range::{AlignH, AlignV, EndDir, Range, SpecialCells};
     pub use crate::style::{Borders, Font, Interior};
     pub use crate::vba::{Vba, VbaStatus};
     pub use crate::workbook::{FileFormat, SheetInfo, Workbook, WorkbookInfo};
@@ -62,14 +67,15 @@ pub mod prelude {
     pub use windows::Win32::System::Com::IDispatch;
 }
 
-pub use app::{App, WindowInfo, WindowState};
+pub use app::{App, CalcMode, WindowInfo, WindowState};
 pub use chart::{Chart, ChartKind};
 pub use com::variant::{CellValue, ComValue};
 pub use engine::{ConnectMode, Engine};
 pub use error::{rgb, ExcelError};
+pub use fonts::system_font_names;
 pub use pagesetup::{Margin, Orientation, PageSetup, PaperSize, Section};
 pub use process::{kill, kill_all, processes, ProcessInfo};
-pub use range::{AlignH, AlignV, Range};
+pub use range::{AlignH, AlignV, EndDir, Range, SpecialCells};
 pub use style::{Borders, Font, Interior};
 pub use vba::{Vba, VbaStatus};
 pub use workbook::{FileFormat, SheetInfo, Workbook, WorkbookInfo};

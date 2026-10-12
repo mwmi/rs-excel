@@ -49,6 +49,11 @@ pub(crate) fn com_err(
     .with_hint(common_hint(hr))
 }
 
+/// 错误是否为 DISP_E_MEMBERNOTFOUND（成员不存在，用于 Formula2→Formula 等回退）。
+pub(crate) fn member_notfound(e: &anyhow::Error) -> bool {
+    e.to_string().contains("0x80020003")
+}
+
 /// 包住一个 `IDispatch` 指针 + 对象路径。
 #[derive(Clone)]
 pub struct IDispatchWrapper {

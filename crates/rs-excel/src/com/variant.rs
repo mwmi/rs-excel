@@ -154,6 +154,44 @@ impl From<bool> for CellValue {
     }
 }
 
+/// Excel 序列日期（1899-12-30 纪元）→ `"yyyy-mm-dd"` / `"yyyy-mm-dd hh:mm:ss"`。
+fn serial_to_date_text(serial: f64) -> String {
+    let mut days = serial.floor() as i64;
+    let rem = (serial - serial.floor()) * 86400.0;
+    let mut secs = rem.round() as i64;
+    if secs >= 86400 {
+        // 四舍五入进位到次日
+        days += 1;
+        secs = 0;
+    }
+    // 天数自 1970-01-01 起算，套用 civil_from_days（Hinnant 算法）
+    let z = days - 25569 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    let date = format!("{y:04}-{m:02}-{d:02}");
+    if secs == 0 {
+        date
+    } else {
+        format!(
+            "{date} {:02}:{:02}:{:02}",
+            secs / 3600,
+            secs % 3600 / 60,
+            secs % 60
+        )
+    }
+    .trim_end()
+    .to_string()
+}
+
 /// VARIANT → CellValue（严格按 vt 分派，杜绝直接读 union 拿到垃圾值）。
 pub(crate) fn variant_to_cellvalue(v: &VARIANT) -> CellValue {
     let vt: u16 = unsafe { v.Anonymous.Anonymous.vt }.0;
@@ -185,4 +223,14 @@ pub(crate) fn variant_to_cellvalue(v: &VARIANT) -> CellValue {
             CellValue::Text(format!("<未支持的 VARIANT 类型 0x{vt:04X}>"))
         }
     }
+}
+
+/// VARIANT → CellValue（类型化通道）：唯一差异是 `VT_DATE` → 可读日期文本，
+/// 供 `Value`（非 Value2）兼容读取使用。
+pub(crate) fn variant_to_cellvalue_typed(v: &VARIANT) -> CellValue {
+    if unsafe { v.Anonymous.Anonymous.vt }.0 == VT_DATE.0 {
+        let serial = unsafe { v.Anonymous.Anonymous.Anonymous.dblVal };
+        return CellValue::Text(serial_to_date_text(serial));
+    }
+    variant_to_cellvalue(v)
 }

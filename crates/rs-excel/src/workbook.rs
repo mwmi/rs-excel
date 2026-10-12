@@ -72,6 +72,16 @@ impl Workbook {
         self.raw.get("Saved")?.bool()
     }
 
+    /// 是否只读打开。
+    pub fn read_only(&self) -> Result<bool> {
+        self.raw.get("ReadOnly")?.bool()
+    }
+
+    /// 文件格式原始码（51=xlsx，52=xlsm，56=xls，6=csv，见 [FileFormat]）。
+    pub fn file_format(&self) -> Result<i32> {
+        self.raw.get("FileFormat")?.int()
+    }
+
     pub fn sheet_count(&self) -> Result<i32> {
         self.raw.get_obj("Worksheets", "Worksheets")?.get("Count")?.int()
     }
@@ -186,5 +196,29 @@ impl Workbook {
     /// 关闭工作簿。`save` 是否保存改动。
     pub fn close(&self, save: bool) -> Result<()> {
         self.raw.call("Close", vec![save.into()]).map(|_| ())
+    }
+
+    /// 保护工作簿结构（禁止增删/移动工作表）。
+    pub fn protect(&self, password: &str) -> Result<()> {
+        self.raw
+            .call_named(
+                "Protect",
+                vec![],
+                &[("Password", password.into()), ("Structure", true.into())],
+            )
+            .map(|_| ())
+    }
+
+    /// 取消结构保护。
+    pub fn unprotect(&self, password: &str) -> Result<()> {
+        self.raw.call("Unprotect", vec![password.into()]).map(|_| ())
+    }
+
+    /// 保存副本（备份首选，不影响当前文件与保存状态）。路径需为绝对路径。
+    pub fn save_copy_as(&self, path: &str) -> Result<()> {
+        self.raw
+            .call("SaveCopyAs", vec![path.into()])
+            .map(|_| ())
+            .map_err(|e| ExcelError::hint(e, "路径需为绝对路径；相对路径可用 app 侧工具先转绝对"))
     }
 }

@@ -28,7 +28,7 @@ use reedline::{
     Suggestion, default_emacs_keybindings,
 };
 
-use rs_excel::processes;
+use rs_excel::{processes, system_font_names};
 
 use crate::commands::State;
 
@@ -54,6 +54,25 @@ const FONT_PROPS: &[(&str, &str)] = &[
     ("size", "字号"),
     ("color", "颜色(#RRGGBB/r,g,b)"),
     ("name", "字体名"),
+];
+const BOOL_VALUES: &[(&str, &str)] = &[("true", "真"), ("false", "假")];
+const COLOR_VALUES: &[(&str, &str)] = &[
+    ("#FF0000", "红"),
+    ("#FFC000", "橙"),
+    ("#FFFF00", "黄"),
+    ("#00B050", "绿"),
+    ("#0070C7", "蓝"),
+    ("#7030A0", "紫"),
+    ("#000000", "黑"),
+];
+const NUM_FORMATS: &[(&str, &str)] = &[
+    ("0.00", "两位小数"),
+    ("#,##0", "千分位整数"),
+    ("0.00%", "百分比"),
+    ("yyyy-mm-dd", "日期"),
+    ("yyyy-mm-dd hh:mm", "日期时间"),
+    ("@", "文本"),
+    ("General", "常规"),
 ];
 const RAW_KINDS: &[(&str, &str)] = &[("get", "读属性"), ("call", "调方法"), ("put", "写属性")];
 const PAPERS: &[(&str, &str)] = &[
@@ -116,6 +135,9 @@ pub enum ArgSpec {
     OptFixed(&'static [(&'static str, &'static str)]),
     /// 动态候选（可变借用会话状态，候选函数可自动接管应用）+ 帮助显示标签
     Dynamic(fn(&mut State) -> Vec<String>, &'static str),
+    /// 上下文相关候选：按已输入的前序 token（不含当前词）决定当前参数候选，
+    /// 可访问会话状态（如 `font A1 bold` → true/false，`font A1 name` → 系统字体列表）+ 帮助显示标签
+    Ctx(fn(&mut State, &[&str]) -> Vec<(String, String)>, &'static str),
     /// 文件路径（扫描文件系统）
     Path,
     /// 自由文本：不补全，帮助中显示 <占位符>
@@ -169,15 +191,15 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec { group: G_WS, name: "addsheet", desc: "末尾新增工作表", args: &[ArgSpec::Any("名称")] },
     CommandSpec { group: G_WS, name: "info", desc: "当前上下文摘要", args: &[] },
     // 单元格
-    CommandSpec { group: G_CELL, name: "get", desc: "读单元格/区域（多格输出表格）", args: &[ArgSpec::Any("地址")] },
-    CommandSpec { group: G_CELL, name: "set", desc: "写单元格", args: &[ArgSpec::Any("地址"), ArgSpec::Any("文本")] },
-    CommandSpec { group: G_CELL, name: "tget", desc: "区域批量读（TSV 输出）", args: &[ArgSpec::Any("区域")] },
-    CommandSpec { group: G_CELL, name: "tset", desc: "区域批量写（逐行输入 TSV，单独 . 结束）", args: &[ArgSpec::Any("锚点")] },
-    CommandSpec { group: G_CELL, name: "formula", desc: "写公式", args: &[ArgSpec::Any("地址"), ArgSpec::Any("公式")] },
-    CommandSpec { group: G_CELL, name: "fmt", desc: "数字格式（如 0.00%）", args: &[ArgSpec::Any("地址"), ArgSpec::Any("数字格式")] },
-    CommandSpec { group: G_CELL, name: "font", desc: "字体属性读取/设置", args: &[ArgSpec::Any("地址"), ArgSpec::Fixed(FONT_PROPS), ArgSpec::OptAny("值")] },
-    CommandSpec { group: G_CELL, name: "merge", desc: "合并区域", args: &[ArgSpec::Any("区域")] },
-    CommandSpec { group: G_CELL, name: "unmerge", desc: "取消合并", args: &[ArgSpec::Any("区域")] },
+    CommandSpec { group: G_CELL, name: "get", desc: "读单元格/区域（多格输出表格）", args: &[ArgSpec::Dynamic(range_candidates, "<地址>")] },
+    CommandSpec { group: G_CELL, name: "set", desc: "写单元格", args: &[ArgSpec::Dynamic(range_candidates, "<地址>"), ArgSpec::Any("文本")] },
+    CommandSpec { group: G_CELL, name: "tget", desc: "区域批量读（TSV 输出）", args: &[ArgSpec::Dynamic(range_candidates, "<区域>")] },
+    CommandSpec { group: G_CELL, name: "tset", desc: "区域批量写（逐行输入 TSV，单独 . 结束）", args: &[ArgSpec::Dynamic(range_candidates, "<锚点>")] },
+    CommandSpec { group: G_CELL, name: "formula", desc: "写公式", args: &[ArgSpec::Dynamic(range_candidates, "<地址>"), ArgSpec::Any("公式")] },
+    CommandSpec { group: G_CELL, name: "fmt", desc: "数字格式（如 0.00%）", args: &[ArgSpec::Dynamic(range_candidates, "<地址>"), ArgSpec::Fixed(NUM_FORMATS)] },
+    CommandSpec { group: G_CELL, name: "font", desc: "字体属性读取/设置", args: &[ArgSpec::Dynamic(range_candidates, "<地址>"), ArgSpec::Fixed(FONT_PROPS), ArgSpec::Ctx(font_value_ctx, "[值]")] },
+    CommandSpec { group: G_CELL, name: "merge", desc: "合并区域", args: &[ArgSpec::Dynamic(range_candidates, "<区域>")] },
+    CommandSpec { group: G_CELL, name: "unmerge", desc: "取消合并", args: &[ArgSpec::Dynamic(range_candidates, "<区域>")] },
     CommandSpec { group: G_CELL, name: "chart", desc: "创建图表", args: &[ArgSpec::Fixed(CHART_TYPES), ArgSpec::Any("数据区"), ArgSpec::Any("锚点")] },
     CommandSpec { group: G_WS, name: "page", desc: "页面设置（无参数查看概览）", args: &[ArgSpec::Sub(&[
         ("margins", "页边距（磅，上 下 左 右 [页眉 页脚]）", &[ArgSpec::Any("上磅"), ArgSpec::Any("下磅"), ArgSpec::Any("左磅"), ArgSpec::Any("右磅"), ArgSpec::OptAny("页眉磅"), ArgSpec::OptAny("页脚磅")]),
@@ -262,6 +284,7 @@ impl ArgSpec {
                 format!("[{v}]")
             }
             Self::Dynamic(_, label) => label.to_string(),
+            Self::Ctx(_, label) => label.to_string(),
             Self::Path => "<路径>".to_string(),
             Self::Any(p) => format!("<{p}>"),
             Self::OptAny(p) => format!("[{p}]"),
@@ -320,6 +343,35 @@ fn process_candidates(st: &mut State) -> Vec<String> {
     }
 }
 
+/// 地址/区域候选：当前工作表的已用区域地址（如 A1:F23）。未选定工作表时无候选。
+fn range_candidates(st: &mut State) -> Vec<String> {
+    let Some(sheet) = &st.sheet else { return vec![] };
+    match sheet.used_addr() {
+        Ok(addr) => vec![addr],
+        Err(_) => vec![],
+    }
+}
+
+/// font 第三个参数的候选：由第二个参数（属性名）决定。
+/// bold/italic/underline → true/false；color → 常用色；name → 系统字体列表（整名插入，可含空格）。
+fn font_value_ctx(_st: &mut State, tokens: &[&str]) -> Vec<(String, String)> {
+    match tokens.get(2).copied() {
+        Some("bold") | Some("italic") | Some("underline") => BOOL_VALUES
+            .iter()
+            .map(|(v, d)| (v.to_string(), format!("{v:<10}{d}")))
+            .collect(),
+        Some("color") => COLOR_VALUES
+            .iter()
+            .map(|(v, d)| (v.to_string(), format!("{v:<10}{d}")))
+            .collect(),
+        Some("name") => system_font_names()
+            .into_iter()
+            .map(|n| (format!("{n} "), n))
+            .collect(),
+        _ => vec![],
+    }
+}
+
 /// 文件路径候选：扫描当前 token 所在目录，目录候选自动带 `\` 便于续接。
 /// 显示只给文件名，插入值是完整路径；含空格路径无法作为单 token 输入（REPL 以空白分参）。
 fn path_suggestions(partial: &str, span: Span) -> Vec<Suggestion> {
@@ -362,8 +414,8 @@ enum Source {
     Path,
     /// 自由文本（不补全）
     Free,
-    /// 候选列表
-    List(Vec<String>),
+    /// 候选列表：(插入值, 显示文本)。插入值可含空格（如 "Arial Black " 字体名）
+    List(Vec<(String, String)>),
 }
 
 /// 候选是否匹配已输入前缀：整体前缀，或任一空白分段前缀
@@ -415,7 +467,7 @@ impl MenuCompleter {
                 // 候选带说明（菜单显示整行，插入只取分支名）
                 let cands = branches
                     .iter()
-                    .map(|(n, d, _)| format!("{n:<10}{d}"))
+                    .map(|(n, d, _)| (n.to_string(), format!("{n:<10}{d}")))
                     .collect();
                 return Some((token_start, Source::List(cands)));
             }
@@ -423,26 +475,37 @@ impl MenuCompleter {
             let Some(arg) = branch.and_then(|(_, _, branch_args)| branch_args.get(arg_index - 1)) else {
                 return Some((token_start, Source::Free));
             };
-            return Some((token_start, self.classify(arg)));
+            return Some((token_start, self.classify(arg, &tokens)));
         }
 
         // 普通命令：按参数位取规格
         let Some(arg) = spec.args.get(arg_index) else {
             return Some((token_start, Source::Free));
         };
-        Some((token_start, self.classify(arg)))
+        Some((token_start, self.classify(arg, &tokens)))
     }
 
-    /// ArgSpec → 补全来源。
-    fn classify(&self, arg: &ArgSpec) -> Source {
+    /// ArgSpec → 补全来源。`tokens` 为当前词之前已输入的分词（tokens[0] = 命令名）。
+    fn classify(&self, arg: &ArgSpec, tokens: &[&str]) -> Source {
         match arg {
             // 候选带说明（菜单显示整行，插入只取值）
-            ArgSpec::Fixed(f) | ArgSpec::OptFixed(f) => {
-                Source::List(f.iter().map(|(v, d)| format!("{v:<10}{d}")).collect())
-            }
+            ArgSpec::Fixed(f) | ArgSpec::OptFixed(f) => Source::List(
+                f.iter()
+                    .map(|(v, d)| (v.to_string(), format!("{v:<10}{d}")))
+                    .collect(),
+            ),
             ArgSpec::Dynamic(f, _) => match self.state.try_borrow_mut() {
                 // 会话状态被占用时（如 tset 多行输入中）安静退出，避免 panic
-                Ok(mut st) => Source::List(f(&mut st)),
+                Ok(mut st) => Source::List(
+                    f(&mut st)
+                        .into_iter()
+                        .map(|c| (insert_value(&c).to_string(), c))
+                        .collect(),
+                ),
+                Err(_) => Source::Free,
+            },
+            ArgSpec::Ctx(f, _) => match self.state.try_borrow_mut() {
+                Ok(mut st) => Source::List(f(&mut st, tokens)),
                 Err(_) => Source::Free,
             },
             ArgSpec::Path => Source::Path,
@@ -501,11 +564,15 @@ impl Completer for MenuCompleter {
             }
             Source::List(cands) => cands
                 .into_iter()
-                .filter(|c| matches_candidate(c, &lower))
-                .map(|c| Suggestion {
-                    // 插入索引（带确认空格），整行「序号. 名称」仅作显示，避免同一项拆成多行
-                    value: format!("{} ", insert_value(&c)),
-                    display_override: Some(c),
+                .filter(|(_, disp)| matches_candidate(disp, &lower))
+                .map(|(value, disp)| Suggestion {
+                    // 整值插入（可含空格，如 "Arial Black "），尾部空格表示确认
+                    value: if value.ends_with(' ') {
+                        value
+                    } else {
+                        format!("{value} ")
+                    },
+                    display_override: Some(disp),
                     span,
                     ..Default::default()
                 })

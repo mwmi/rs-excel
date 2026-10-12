@@ -16,13 +16,22 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_VARIANT};
 
-use crate::com::variant::{variant_to_cellvalue, CellValue, ComValue};
+use crate::com::variant::{variant_to_cellvalue, variant_to_cellvalue_typed, CellValue, ComValue};
 
 /// 读取 `Range.Value` 返回的 VARIANT：多格 → 2D 网格；单格 → 1x1 网格。
 pub fn variant_to_rows(v: &VARIANT) -> Result<Vec<Vec<CellValue>>> {
+    variant_to_rows_with(v, variant_to_cellvalue)
+}
+
+/// 同 [variant_to_rows]，但日期元素转为可读文本（`Value` 兼容通道用）。
+pub fn variant_to_rows_typed(v: &VARIANT) -> Result<Vec<Vec<CellValue>>> {
+    variant_to_rows_with(v, variant_to_cellvalue_typed)
+}
+
+fn variant_to_rows_with(v: &VARIANT, conv: fn(&VARIANT) -> CellValue) -> Result<Vec<Vec<CellValue>>> {
     let vt: u16 = unsafe { v.Anonymous.Anonymous.vt }.0;
     if vt & VT_ARRAY.0 == 0 {
-        return Ok(vec![vec![variant_to_cellvalue(v)]]);
+        return Ok(vec![vec![conv(v)]]);
     }
     let psa: *mut SAFEARRAY = unsafe { v.Anonymous.Anonymous.Anonymous.parray };
     if psa.is_null() {
@@ -44,7 +53,7 @@ pub fn variant_to_rows(v: &VARIANT) -> Result<Vec<Vec<CellValue>>> {
                 let idx = [r, c]; // 索引向量与维度编号对应：[行, 列]
                 let mut elem = VARIANT::default();
                 SafeArrayGetElement(psa, idx.as_ptr(), &mut elem as *mut VARIANT as *mut _)?;
-                row.push(variant_to_cellvalue(&elem));
+                row.push(conv(&elem));
                 // elem 离开作用域自动 VariantClear，无泄漏
             }
             rows.push(row);

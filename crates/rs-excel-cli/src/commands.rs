@@ -220,14 +220,27 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
         "close" => {
             let save = args != "n";
             st.wb()?.close(save)?;
+            // save=是且文档从未保存时会弹另存框，点取消则工作簿并未关闭 —— 以能否访问为准
+            if st.wb()?.name().is_ok() {
+                bail!("关闭被取消（弹窗点了取消或另存未完成），工作簿仍打开");
+            }
             st.clear_wb();
             println!("已关闭工作簿（保存: {}）", if save { "是" } else { "否" });
         }
         "appquit" => {
-            st.app()?.quit()?;
-            st.clear_wb();
-            st.app = None;
-            println!("应用已退出，连接已断开");
+            let app = st.app()?;
+            // Quit 阻塞至"是否保存"弹窗被处理后才返回：
+            // 返回后应用仍在（连接可访问）即退出被取消，否则已断开
+            app.quit()?;
+            if app.caption().is_ok() {
+                println!(
+                    "退出被取消：未保存文档弹窗选择了取消，连接保持。可先 save/close 再重试，或 alerts off 后 appquit 跳过弹窗"
+                );
+            } else {
+                st.clear_wb();
+                st.app = None;
+                println!("应用已退出，连接已断开");
+            }
         }
         "sheets" => {
             let sheets = st.wb()?.sheets()?;
@@ -457,8 +470,13 @@ fn font_cmd(st: &State, args: &str) -> Result<()> {
     let r = st.sheet()?.range(p[0])?;
     let f = r.font()?;
     let prop = p[1];
-    let val = p.get(2).copied();
-    match (prop, val) {
+    // 值可含空格（如字体名 "Arial Black"）：属性名之后的所有 token 拼回
+    let val = if p.len() > 2 {
+        Some(p[2..].join(" "))
+    } else {
+        None
+    };
+    match (prop, val.as_deref()) {
         ("bold", Some(v)) => f.set_bold(parse_bool(v)?)?,
         ("bold", None) => println!("bold = {}", f.bold()?),
         ("italic", Some(v)) => f.set_italic(parse_bool(v)?)?,
