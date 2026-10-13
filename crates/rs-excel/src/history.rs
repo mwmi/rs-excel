@@ -92,10 +92,17 @@ impl std::fmt::Display for UndoEntry {
     }
 }
 
-/// 操作历史栈（后进先出撤销）。默认上限 50 条，超出丢弃最旧。
-/// 内部 `RefCell`：record/undo 均只需 `&self`，调用方无需 mut 绑定。
+/// 操作历史栈（后进先出撤销 + 恢复）。默认上限 50 条，超出丢弃最旧。
+/// 内部 `RefCell`：record/undo/redo 均只需 `&self`，调用方无需 mut 绑定。
+///
+/// **撤销与恢复是一对快照的互换**：撤销时先把目标区域的「当前状态」拍成一条记录压入
+/// [`redo`](Self::redo)，再写回旧快照；恢复则反过来。所以恢复不需要另存一份「操作日志」，
+/// 两个栈里的条目是同一种东西，只是方向相反。
 pub struct History {
+    /// 撤销栈：**末尾** = 最近一次操作 = 下一个被撤销的
     entries: RefCell<Vec<UndoEntry>>,
+    /// 恢复栈：按被撤销的先后压入（`entries` 弹出的顺序），**末尾** = 最近一次被撤销的
+    redo: RefCell<Vec<UndoEntry>>,
     limit: usize,
 }
 
@@ -113,6 +120,7 @@ impl History {
     pub fn with_limit(limit: usize) -> Self {
         Self {
             entries: RefCell::new(Vec::new()),
+            redo: RefCell::new(Vec::new()),
             limit: limit.max(1),
         }
     }
@@ -127,17 +135,23 @@ impl History {
 
     /// 全部记录摘要（旧→新），如 `#1 tset A1:C5 @ Sheet1!A1:C5`。
     pub fn summary(&self) -> Vec<String> {
-        self.entries
-            .borrow()
-            .iter()
-            .enumerate()
-            .map(|(i, e)| format!("#{} {}", i + 1, e))
-            .collect()
+        summarize(&self.entries)
     }
 
-    /// 清空历史。
+    /// 可恢复记录的数量。
+    pub fn redo_len(&self) -> usize {
+        self.redo.borrow().len()
+    }
+
+    /// 可恢复记录摘要（旧→新，与 [`summary`](Self::summary) 同口径）。
+    pub fn redo_summary(&self) -> Vec<String> {
+        summarize(&self.redo)
+    }
+
+    /// 清空历史（撤销栈与恢复栈一起清）。
     pub fn clear(&self) {
         self.entries.borrow_mut().clear();
+        self.redo.borrow_mut().clear();
     }
 
     // ── 记录（均在修改操作执行前调用） ──
@@ -216,7 +230,7 @@ impl History {
         );
     }
 
-    // ── 撤销 ──
+    // ── 撤销 / 恢复 ──
 
     /// 撤销最近一条记录的操作，返回单行描述（如 `tset A1:C5 @ Sheet1!A1:C5`）。
     pub fn undo(&self, wb: &Workbook) -> Result<String> {
@@ -226,17 +240,82 @@ impl History {
                 .into());
         };
         let desc = entry.to_string();
-        restore(wb, entry.op)?;
+        // 撤销前先把目标区域的「当前状态」拍下来，它就是要恢复回去的那一版
+        let forward = self.look_back(wb, &self.entries, entry)?;
+        // **失败要把条目放回去**：否则调用方一重试就会撤到下一条（撤错东西），
+        // 用户看到的也是"这条已经撤过了"的假象。WPS 在连续批量操作时会偶发
+        // 0x80020009（"发生意外"，通常是服务端正忙），正是靠回退重试来救的
+        if let Err(e) = restore(wb, &forward.0.op) {
+            self.append(&self.entries, forward.0);
+            return Err(e);
+        }
+        if let Some(op) = forward.1 {
+            self.append(&self.redo, UndoEntry { desc: desc.clone(), op });
+        }
         Ok(desc)
     }
 
-    fn push(&self, desc: String, op: UndoOp) {
-        let mut entries = self.entries.borrow_mut();
-        while entries.len() >= self.limit {
-            entries.remove(0);
+    /// 恢复最近一次被撤销的操作（重做），返回单行描述。
+    pub fn redo(&self, wb: &Workbook) -> Result<String> {
+        let Some(entry) = self.redo.borrow_mut().pop() else {
+            return Err(ExcelError::new("redo", "history", "没有可恢复的操作")
+                .with_hint("只有撤销过的操作能恢复；撤销后又做了新的修改，恢复即作废")
+                .into());
+        };
+        let desc = entry.to_string();
+        // 与 undo 镜像：恢复前把「当前状态」拍下来，放回撤销栈就能再撤回去
+        let back = self.look_back(wb, &self.redo, entry)?;
+        if let Err(e) = restore(wb, &back.0.op) {
+            self.append(&self.redo, back.0);
+            return Err(e);
         }
-        entries.push(UndoEntry { desc, op });
+        if let Some(op) = back.1 {
+            self.append(&self.entries, UndoEntry { desc: desc.clone(), op });
+        }
+        Ok(desc)
     }
+
+    /// 取出条目 `entry` 的「当前状态」快照（= 反向应用后能回到的那一版）。
+    /// 快照失败就把 `entry` 放回 `stack` 并原样返回错误（调用方不必再管）。
+    fn look_back(
+        &self,
+        wb: &Workbook,
+        stack: &RefCell<Vec<UndoEntry>>,
+        entry: UndoEntry,
+    ) -> Result<(UndoEntry, Option<UndoOp>)> {
+        match snapshot_like(wb, &entry.op) {
+            Ok(op) => Ok((entry, op)),
+            Err(e) => {
+                self.append(stack, entry);
+                Err(e)
+            }
+        }
+    }
+
+    /// 记录一次新操作：**旧的恢复点作废**（撤销后又改，就回不去了 —— 与 Word/Excel 一致）
+    fn push(&self, desc: String, op: UndoOp) {
+        self.redo.borrow_mut().clear();
+        self.append(&self.entries, UndoEntry { desc, op });
+    }
+
+    /// 压栈并裁掉最旧的（上限）。
+    fn append(&self, stack: &RefCell<Vec<UndoEntry>>, entry: UndoEntry) {
+        let mut stack = stack.borrow_mut();
+        while stack.len() >= self.limit {
+            stack.remove(0);
+        }
+        stack.push(entry);
+    }
+}
+
+/// 把一个栈格式化成「`#序号 描述`」清单（旧→新）。
+fn summarize(stack: &RefCell<Vec<UndoEntry>>) -> Vec<String> {
+    stack
+        .borrow()
+        .iter()
+        .enumerate()
+        .map(|(i, e)| format!("#{} {}", i + 1, e))
+        .collect()
 }
 
 /// 内容快照：读公式网格（常量格得到原类型值，公式格得到 `=...`）+ 合并状态。
@@ -265,8 +344,10 @@ fn snap_formats(ws: &Worksheet, addr: &str) -> Result<FormatSnapshot> {
         sheet: ws.name()?,
         addr: addr.to_string(),
         number_format: text(g("NumberFormat")),
-        h_align: i("HorizontalAlignment"),
-        v_align: i("VerticalAlignment"),
+        // 0 不是合法 xlHAlign/xlVAlign：WPS 对「混合/常规」区域会返回 0（而非 Null），
+        // 这种值写回必抛 0x80020009，记 None 跳过（其余格式项照常还原）
+        h_align: i("HorizontalAlignment").filter(|v| *v != 0),
+        v_align: i("VerticalAlignment").filter(|v| *v != 0),
         wrap: b("WrapText"),
         indent: i("IndentLevel"),
         orientation: i("Orientation"),
@@ -283,8 +364,8 @@ fn snap_formats(ws: &Worksheet, addr: &str) -> Result<FormatSnapshot> {
     })
 }
 
-/// 按类型执行逆向恢复。
-fn restore(wb: &Workbook, op: UndoOp) -> Result<()> {
+/// 按类型执行逆向恢复（借 op：失败时调用方还要把它装回栈里）。
+fn restore(wb: &Workbook, op: &UndoOp) -> Result<()> {
     match op {
         UndoOp::Cells(s) => {
             let ws = target_sheet(wb, &s.sheet)?;
@@ -292,7 +373,7 @@ fn restore(wb: &Workbook, op: UndoOp) -> Result<()> {
             if rng.is_merged()? && !s.merged {
                 rng.unmerge()?;
             }
-            write_back(&ws, &rng, &s)?;
+            write_back(&ws, &rng, s)?;
             if s.merged && !rng.is_merged()? {
                 rng.merge()?;
             }
@@ -300,7 +381,7 @@ fn restore(wb: &Workbook, op: UndoOp) -> Result<()> {
         }
         UndoOp::Formats(s) => {
             let rng = target_range(wb, &s.sheet, &s.addr)?;
-            apply_formats(&rng, &s)
+            apply_formats(&rng, s)
         }
         UndoOp::Both(c, f) => {
             let ws = target_sheet(wb, &c.sheet)?;
@@ -308,14 +389,14 @@ fn restore(wb: &Workbook, op: UndoOp) -> Result<()> {
             if rng.is_merged()? && !c.merged {
                 rng.unmerge()?;
             }
-            write_back(&ws, &rng, &c)?;
+            write_back(&ws, &rng, c)?;
             if c.merged && !rng.is_merged()? {
                 rng.merge()?;
             }
-            apply_formats(&rng, &f)
+            apply_formats(&rng, f)
         }
         UndoOp::SheetAdded { name } => {
-            let ws = target_sheet(wb, &name)?;
+            let ws = target_sheet(wb, name)?;
             // 删表可能弹确认框：临时关告警，结束恢复
             let app = wb.raw().get("Application")?.idispatch()?;
             let prev = app.get("DisplayAlerts").ok().and_then(|v| v.bool().ok());
@@ -326,7 +407,7 @@ fn restore(wb: &Workbook, op: UndoOp) -> Result<()> {
             }
             res
         }
-        UndoOp::SheetRenamed { old, new } => target_sheet(wb, &new)?.rename(&old),
+        UndoOp::SheetRenamed { old, new } => target_sheet(wb, new)?.rename(old),
     }
 }
 
@@ -352,58 +433,84 @@ fn write_back(ws: &Worksheet, rng: &Range, s: &CellsSnapshot) -> Result<()> {
 }
 
 /// 格式快照逐项还原（None 跳过）。
+///
+/// **单项写不进去不能中断整条撤销**：有些值引擎读得出来却写不回去（见 `snap_formats`
+/// 里 WPS 返回 0 的对齐），一 put 就抛 0x80020009。旧实现遇错即整个 restore 失败，
+/// 而 `History::undo` 失败会把条目放回栈顶 —— 于是整个回退栈被一条永远撤不掉的记录
+/// 卡死（用户实报：无论点哪个回退按钮都报同一个错）。格式只是外观，写不进去的那一项
+/// 跳过即可，别拖垮其余项与整个栈。
 fn apply_formats(rng: &Range, s: &FormatSnapshot) -> Result<()> {
     let raw = rng.raw();
     if let Some(v) = &s.number_format {
-        raw.put("NumberFormat", vec![v.clone().into()])?;
+        let _ = raw.put("NumberFormat", vec![v.clone().into()]);
     }
     if let Some(v) = s.h_align {
-        raw.put("HorizontalAlignment", vec![v.into()])?;
+        let _ = raw.put("HorizontalAlignment", vec![v.into()]);
     }
     if let Some(v) = s.v_align {
-        raw.put("VerticalAlignment", vec![v.into()])?;
+        let _ = raw.put("VerticalAlignment", vec![v.into()]);
     }
     if let Some(v) = s.wrap {
-        raw.put("WrapText", vec![v.into()])?;
+        let _ = raw.put("WrapText", vec![v.into()]);
     }
     if let Some(v) = s.indent {
-        raw.put("IndentLevel", vec![v.into()])?;
+        let _ = raw.put("IndentLevel", vec![v.into()]);
     }
     if let Some(v) = s.orientation {
-        raw.put("Orientation", vec![v.into()])?;
+        let _ = raw.put("Orientation", vec![v.into()]);
     }
     if let Some(v) = s.shrink {
-        raw.put("ShrinkToFit", vec![v.into()])?;
+        let _ = raw.put("ShrinkToFit", vec![v.into()]);
     }
     if let Some(v) = s.col_width {
-        raw.put("ColumnWidth", vec![v.into()])?;
+        let _ = raw.put("ColumnWidth", vec![v.into()]);
     }
     if let Some(v) = s.row_height {
-        raw.put("RowHeight", vec![v.into()])?;
+        let _ = raw.put("RowHeight", vec![v.into()]);
     }
-    let f = rng.font()?;
-    if let Some(v) = s.font_bold {
-        f.set_bold(v)?;
-    }
-    if let Some(v) = s.font_italic {
-        f.set_italic(v)?;
-    }
-    if let Some(v) = s.font_underline {
-        f.set_underline(v)?;
-    }
-    if let Some(v) = s.font_size {
-        f.set_size(v)?;
-    }
-    if let Some(v) = s.font_color {
-        f.set_color(v)?;
-    }
-    if let Some(v) = &s.font_name {
-        f.set_name(v)?;
+    if let Ok(f) = rng.font() {
+        if let Some(v) = s.font_bold {
+            let _ = f.set_bold(v);
+        }
+        if let Some(v) = s.font_italic {
+            let _ = f.set_italic(v);
+        }
+        if let Some(v) = s.font_underline {
+            let _ = f.set_underline(v);
+        }
+        if let Some(v) = s.font_size {
+            let _ = f.set_size(v);
+        }
+        if let Some(v) = s.font_color {
+            let _ = f.set_color(v);
+        }
+        if let Some(v) = &s.font_name {
+            let _ = f.set_name(v);
+        }
     }
     if let Some(v) = s.interior_color {
-        rng.interior()?.set_color(v)?;
+        if let Ok(interior) = rng.interior() {
+            let _ = interior.set_color(v);
+        }
     }
     Ok(())
+}
+
+/// 按某条记录的**目标区域**取「当前状态」快照，做成一条可反向应用的条目
+/// （撤销 ⇄ 恢复互换用）。
+///
+/// 工作表增删 / 改名没有可逆快照（重做一张删掉的表也恢复不出内容），返回 `None`：
+/// 那类记录撤销后不进恢复栈（界面上表现为「这条不能恢复」）。
+fn snapshot_like(wb: &Workbook, op: &UndoOp) -> Result<Option<UndoOp>> {
+    Ok(match op {
+        UndoOp::Cells(c) => Some(UndoOp::Cells(snap_cells(&target_sheet(wb, &c.sheet)?, &c.addr)?)),
+        UndoOp::Formats(f) => Some(UndoOp::Formats(snap_formats(&target_sheet(wb, &f.sheet)?, &f.addr)?)),
+        UndoOp::Both(c, f) => Some(UndoOp::Both(
+            snap_cells(&target_sheet(wb, &c.sheet)?, &c.addr)?,
+            snap_formats(&target_sheet(wb, &f.sheet)?, &f.addr)?,
+        )),
+        UndoOp::SheetAdded { .. } | UndoOp::SheetRenamed { .. } => None,
+    })
 }
 
 fn target_sheet(wb: &Workbook, name: &str) -> Result<Worksheet> {

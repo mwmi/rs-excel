@@ -188,7 +188,12 @@ impl IDispatchWrapper {
     }
 
     /// 带命名参数的方法调用，如 `call_named("SetSourceData", vec![], &[("Source", v)])`。
-    /// 位置参数逆序放前，命名参数按声明顺序放后（与 VB/pywin32 约定一致）。
+    ///
+    /// **顺序很重要**：COM 的 DISPPARAMS 规定 `rgvarg` 里**具名参数在前**（顺序与
+    /// `rgdispidNamedArgs` 一一对应），位置参数排在后面且**逆序**。
+    /// 这里曾经写成「位置参数逆序放前、具名参数追加在后」—— 运行时按 `cNamedArgs` 从头取具名参数，
+    /// 取到的其实是位置参数，于是：同类型的参数被静默对调（`Find` 的 What/LookAt、`Copy` 的 After…），
+    /// 类型不同的直接报 `0x80020005 类型不匹配`（条件格式的 `Add`，用户实报）。
     pub fn call_named(
         &self,
         name: &str,
@@ -211,11 +216,13 @@ impl IDispatchWrapper {
         }
         .map_err(|e| com_err("dispid", name, &self.ctx, e))?;
 
-        let mut variants: Vec<VARIANT> = args.into_iter().map(VARIANT::from).collect();
-        variants.reverse();
+        let mut variants: Vec<VARIANT> = Vec::with_capacity(args.len() + named.len());
         for (_, v) in named {
             variants.push(VARIANT::from(v.clone()));
         }
+        let mut positional: Vec<VARIANT> = args.into_iter().map(VARIANT::from).collect();
+        positional.reverse();
+        variants.extend(positional);
         let mut named_ids: Vec<i32> = dispids[1..].to_vec();
         let params = DISPPARAMS {
             rgvarg: variants.as_mut_ptr(),
