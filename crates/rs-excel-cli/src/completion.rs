@@ -92,6 +92,8 @@ const CLEAR_KINDS: &[(&str, &str)] = &[
     ("formats", "只清格式"),
     ("all", "全部"),
 ];
+/// history 命令子命令。
+const HISTORY_SUBS: &[(&str, &str)] = &[("clear", "清空历史")];
 const BOOL_VALUES: &[(&str, &str)] = &[("true", "真"), ("false", "假")];
 const COLOR_VALUES: &[(&str, &str)] = &[
     ("#FF0000", "红"),
@@ -128,13 +130,19 @@ const ORIENTS: &[(&str, &str)] = &[("portrait", "纵向"), ("landscape", "横向
 const HF_POS: &[(&str, &str)] = &[("left", "左"), ("center", "中"), ("right", "右")];
 const TITLE_KINDS: &[(&str, &str)] = &[("rows", "标题行"), ("cols", "标题列")];
 const WINDOW_STATES: &[(&str, &str)] = &[("max", "最大化"), ("min", "最小化"), ("normal", "普通")];
+const EV_SUBS: &[(&str, &str)] = &[
+    ("on", "订阅事件"),
+    ("poll", "取走新事件"),
+    ("state", "状态快照"),
+    ("off", "退订"),
+];
 
 // ── 命令上下文分组（Tab 候选的可见性与置顶） ──
 
 /// 未选定工作簿时置顶的工作簿管理命令（save/saveas/pdf/close 因需要工作簿而被隐藏）。
 const WB_MGMT_CMDS: &[&str] = &["list", "use", "new", "open", "save", "saveas", "pdf", "close"];
 /// 已选定工作簿时置顶的工作表命令。
-const SHEET_CMDS: &[&str] = &["focus", "sheets", "sheet", "addsheet"];
+const SHEET_CMDS: &[&str] = &["focus", "sheets", "sheet", "addsheet", "undo", "history"];
 /// 已选定工作表时置顶的单元格/页面/VBA 命令。
 const SHEET_CTX_CMDS: &[&str] = &[
     "info", "get", "set", "tget", "tset", "formula", "fmt", "font", "align", "size", "chars",
@@ -244,6 +252,8 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec { group: G_CELL, name: "replace", desc: "区域/整表替换", args: &[ArgSpec::Any("区域|all"), ArgSpec::Any("旧文本"), ArgSpec::Any("新文本")] },
     CommandSpec { group: G_CELL, name: "merge", desc: "合并区域", args: &[ArgSpec::Dynamic(range_candidates, "<区域>")] },
     CommandSpec { group: G_CELL, name: "unmerge", desc: "取消合并", args: &[ArgSpec::Dynamic(range_candidates, "<区域>")] },
+    CommandSpec { group: G_CELL, name: "undo", desc: "撤销最近的记录操作（多级，默认 1 步）", args: &[ArgSpec::OptAny("步数")] },
+    CommandSpec { group: G_CELL, name: "history", desc: "操作历史（新→旧列出；clear 清空）", args: &[ArgSpec::OptFixed(HISTORY_SUBS)] },
     CommandSpec { group: G_CELL, name: "chart", desc: "创建图表", args: &[ArgSpec::Fixed(CHART_TYPES), ArgSpec::Any("数据区"), ArgSpec::Any("锚点")] },
     CommandSpec { group: G_WS, name: "page", desc: "页面设置（无参数查看概览）", args: &[ArgSpec::Sub(&[
         ("margins", "页边距（磅，上 下 左 右 [页眉 页脚]）", &[ArgSpec::Any("上磅"), ArgSpec::Any("下磅"), ArgSpec::Any("左磅"), ArgSpec::Any("右磅"), ArgSpec::OptAny("页眉磅"), ArgSpec::OptAny("页脚磅")]),
@@ -272,6 +282,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec { group: G_WIN, name: "visible", desc: "显示/隐藏应用窗口", args: &[ArgSpec::Fixed(ON_OFF)] },
     CommandSpec { group: G_WIN, name: "alerts", desc: "弹窗告警：无参数查看，on|off 开关", args: &[ArgSpec::OptFixed(ON_OFF)] },
     CommandSpec { group: G_WIN, name: "state", desc: "查看/设置窗口状态（无参数=查看）", args: &[ArgSpec::OptFixed(WINDOW_STATES)] },
+    CommandSpec { group: G_WIN, name: "ev", desc: "事件订阅：无参查看 / on 订阅 / poll 取事件 / state 快照 / off 退订", args: &[ArgSpec::Fixed(EV_SUBS)] },
     // 扩展
     CommandSpec { group: G_EXT, name: "raw", desc: "直接调用 COM 成员（测试未封装 API）", args: &[ArgSpec::Fixed(RAW_KINDS), ArgSpec::Any("成员"), ArgSpec::OptAny("参数")] },
     // 别名（group 为空，不进帮助）

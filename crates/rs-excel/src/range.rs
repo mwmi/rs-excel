@@ -201,6 +201,17 @@ impl Range {
         self.raw.put("NumberFormat", vec![fmt.into()])
     }
 
+    /// 批量读公式网格（走 `Formula2`，引擎不支持自动回退 `Formula`）。
+    /// 常量格返回其原类型值（Number/Text/Bool），公式格返回 `=...` 公式文本。
+    pub fn formulas(&self) -> Result<Vec<Vec<CellValue>>> {
+        let res = match self.raw.get("Formula2") {
+            Ok(r) => r,
+            Err(e) if member_notfound(&e) => self.raw.get("Formula")?,
+            Err(e) => return Err(e),
+        };
+        variant_to_rows(&res.v)
+    }
+
     /// 按成员名读公式；Formula2 不存在（MEMBERNOTFOUND）时回退 Formula。
     fn formula_by(&self, member: &str) -> Result<String> {
         let res = match self.raw.get(member) {

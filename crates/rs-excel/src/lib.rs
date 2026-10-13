@@ -32,12 +32,33 @@
 //!   `worksheet.shapes()` → 形状/图片/文本框的增删改查、外观、文本与批量操作。
 //! - **VBA 双通道**：简单操作走内置 API；复杂操作走 `Vba::run_macro`（无需设置）
 //!   或 `Vba::execute`（注入临时模块，需开启信任访问）。
+//! - **操作撤销**：经 COM 做的修改不进应用撤销栈（`Application.Undo` 无效），
+//!   用 [`History`] 在修改前记录快照、事后撤销（默认 50 条，后进先出）：
+//!   ```no_run
+//!   # let hist = rs_excel::History::new();
+//!   # let (sheet, wb) = unreachable!();
+//!   # let addr = "A1";
+//!   hist.record(&sheet, addr, "写入前")?; // 修改前记录
+//!   // ... 执行修改 ...
+//!   let desc = hist.undo(&wb)?;           // 撤销最近一次，返回单行描述
+//!   ```
+//! - **事件订阅**：[`EventMonitor`] 经 COM 连接点订阅 Application 级事件
+//!   （工作簿开关/激活、工作表激活、选区变化、单元格修改等），原生回调推送
+//!   零轮询零延迟；[`App::state`] 按需读取单行状态快照：
+//!   ```no_run
+//!   # let mut app = unreachable!();
+//!   let mon = EventMonitor::start(&app)?;
+//!   for ev in mon.poll() { println!("{ev}"); } // 如 "选区变化: Book1.xlsx > Sheet3!B2:C5"
+//!   println!("{}", app.state()?);              // "Book1.xlsx | Sheet3 | 选区 B2:C5 | ..."
+//!   ```
 //! - **颜色格式**：COM 内部为 OLE 格式 `0x00BBGGRR`，统一用 [`rgb`] 助手构造。
 
 pub mod com;
 pub mod engine;
 pub mod error;
+pub mod events;
 pub mod fonts;
+pub mod history;
 pub mod pagesetup;
 pub mod process;
 pub mod shape;
@@ -57,7 +78,9 @@ pub mod prelude {
     pub use crate::com::variant::{CellValue, ComValue};
     pub use crate::engine::{ConnectMode, Engine};
     pub use crate::error::{rgb, ExcelError};
+    pub use crate::events::{AppState, EventMonitor, ExcelEvent};
     pub use crate::fonts::system_font_names;
+    pub use crate::history::{History, UndoEntry};
     pub use crate::pagesetup::{Margin, Orientation, PageSetup, PaperSize, Section};
     pub use crate::process::{bring_to_front, flash_window, kill, kill_all, processes, restore_if_minimized, ProcessInfo};
     pub use crate::range::{AlignH, AlignV, EndDir, Range, SpecialCells};
@@ -78,7 +101,9 @@ pub use chart::{Chart, ChartKind};
 pub use com::variant::{CellValue, ComValue};
 pub use engine::{ConnectMode, Engine};
 pub use error::{rgb, ExcelError};
+pub use events::{AppState, EventMonitor, ExcelEvent};
 pub use fonts::system_font_names;
+pub use history::{History, UndoEntry};
 pub use pagesetup::{Margin, Orientation, PageSetup, PaperSize, Section};
 pub use process::{bring_to_front, flash_window, kill, kill_all, processes, restore_if_minimized, ProcessInfo};
 pub use range::{AlignH, AlignV, EndDir, Range, SpecialCells};

@@ -495,7 +495,7 @@ fn verify_engine(disp: &IDispatch, engine: Engine) -> Result<()> {
 /// `GetActiveObject` 可能连到被接管的实例（而注册表未劫持时 `connect new` 却能
 /// 创建正确的引擎）。因此快路径命中后按进程可执行名校验，不匹配则枚举 ROT
 /// 逐项校验，找到真正属于目标引擎的实例。
-fn attach_engine(clsid: &GUID, engine: Engine) -> Result<IDispatch> {
+pub(crate) fn attach_engine(clsid: &GUID, engine: Engine) -> Result<IDispatch> {
     let mut unk: Option<IUnknown> = None;
     unsafe { GetActiveObject(clsid, None, &mut unk).ok() };
     if let Some(disp) = unk.and_then(|u| u.cast::<IDispatch>().ok()) {

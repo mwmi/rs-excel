@@ -17,6 +17,10 @@ pub struct State {
     pub app: Option<App>,
     pub wb: Option<Workbook>,
     pub sheet: Option<Worksheet>,
+    /// 操作历史（修改类命令自动记录，undo/history 命令使用）
+    pub hist: History,
+    /// 事件订阅（ev 命令使用）
+    pub ev: Option<EventMonitor>,
     wb_label: String,
     sheet_label: String,
 }
@@ -28,6 +32,8 @@ impl State {
             app: None,
             wb: None,
             sheet: None,
+            hist: History::new(),
+            ev: None,
             wb_label: String::new(),
             sheet_label: String::new(),
         }
@@ -53,6 +59,13 @@ impl State {
             self.app = Some(App::connect(self.engine, ConnectMode::Attach)?);
         }
         Ok(self.app.as_ref().unwrap())
+    }
+
+    /// 退订事件（断开连接/切引擎时调用，避免接收器残留在旧实例）。
+    fn stop_ev(&mut self) {
+        if let Some(mut mon) = self.ev.take() {
+            mon.stop();
+        }
     }
 
     fn wb(&self) -> Result<&Workbook> {
@@ -120,6 +133,7 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
                     other => bail!("未知引擎 '{other}'，可选 wps|excel"),
                 };
                 st.clear_wb();
+                st.stop_ev();
                 st.app = None;
                 println!("已切换为 {}，重新 connect 生效", st.engine.label());
             }
@@ -144,6 +158,7 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
             };
             let cap = app.caption().unwrap_or_default();
             st.clear_wb(); // 重连必清工作簿/工作表上下文（断开旧连接）
+            st.stop_ev();
             if had {
                 println!("已断开上一个连接");
             }
@@ -242,10 +257,12 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
         }
         "appquit" => {
             st.app()?.quit()?;
+            st.stop_ev();
             st.clear_wb();
             st.app = None;
             println!("已退出应用，连接已断开");
         }
+        "ev" => ev_cmd(st, args)?,
         "sheets" => {
             let sheets = st.wb()?.sheets()?;
             if sheets.is_empty() {
@@ -274,6 +291,7 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
                 bail!("用法: addsheet <名称>");
             }
             let sh = st.wb()?.add_sheet(args, None)?;
+            st.hist.record_sheet_added(args, format!("addsheet {args}"));
             println!("已新增工作表: {}", sh.name()?);
         }
         "info" => {
@@ -324,8 +342,10 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
                 bail!("用法: set <地址> <文本>");
             }
             // 字面 \n 转为换行符，单行输入即可写多段文本（单元格内换行 = vbLf）
-            st.sheet()?.range(addr.trim())?.set_value(text.replace("\\n", "\n"))?;
-            println!("已写入 {}（{}）", addr.trim(), text);
+            let addr = addr.trim();
+            st.hist.record(st.sheet()?, addr, format!("set {addr}"))?;
+            st.sheet()?.range(addr)?.set_value(text.replace("\\n", "\n"))?;
+            println!("已写入 {addr}（{text}）");
         }
         "tget" => {
             if args.is_empty() {
@@ -347,6 +367,7 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
                 buf.push_str(&l);
                 buf.push('\n');
             }
+            st.hist.record_tsv(st.sheet()?, args, &buf, format!("tset {args}"))?;
             st.sheet()?.write_tsv(args, &buf)?;
             println!("已写入 {}", st.sheet_label);
         }
@@ -357,8 +378,10 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
             if f.is_empty() {
                 bail!("用法: formula <地址> <公式>");
             }
-            st.sheet()?.range(addr.trim())?.set_formula(f)?;
-            println!("已写入公式 {}（{f}）", addr.trim());
+            let addr = addr.trim();
+            st.hist.record(st.sheet()?, addr, format!("formula {addr}"))?;
+            st.sheet()?.range(addr)?.set_formula(f)?;
+            println!("已写入公式 {addr}（{f}）");
         }
         "fmt" => {
             let (addr, fmt) = args
@@ -367,8 +390,10 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
             if fmt.is_empty() {
                 bail!("用法: fmt <地址> <数字格式>");
             }
-            st.sheet()?.range(addr.trim())?.number_format(fmt)?;
-            println!("已设置 {} 数字格式: {fmt}", addr.trim());
+            let addr = addr.trim();
+            st.hist.record_fmt(st.sheet()?, addr, format!("fmt {addr}"))?;
+            st.sheet()?.range(addr)?.number_format(fmt)?;
+            println!("已设置 {addr} 数字格式: {fmt}");
         }
         "font" => font_cmd(st, args)?,
         "align" => align_cmd(st, args)?,
@@ -380,11 +405,14 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
                 .map(|(a, k)| (a.trim(), k.trim()))
                 .unwrap_or((args, "contents"));
             let r = st.sheet()?.range(addr)?;
+            if !matches!(kind, "contents" | "formats" | "all") {
+                bail!("清除类型应为 contents|formats|all（得到 '{kind}'，contents=只清内容保留格式）");
+            }
+            st.hist.record_all(st.sheet()?, addr, format!("clear {addr}"))?;
             match kind {
                 "contents" => r.clear_contents()?,
                 "formats" => r.clear_formats()?,
-                "all" => r.clear()?,
-                other => bail!("清除类型应为 contents|formats|all（得到 '{other}'，contents=只清内容保留格式）"),
+                _ => r.clear()?,
             }
             println!("已清除 {addr}（{kind}）");
         }
@@ -407,14 +435,17 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
             } else {
                 st.sheet()?.range(p[0])?
             };
+            st.hist.record_used(st.sheet()?, format!("replace {}", p[0]))?;
             r.replace(p[1], p[2])?;
             println!("已替换 {0}: {1} → {2}", p[0], p[1], p[2]);
         }
         "merge" => {
+            st.hist.record_all(st.sheet()?, args, format!("merge {args}"))?;
             st.sheet()?.range(args)?.merge()?;
             println!("已合并 {args}");
         }
         "unmerge" => {
+            st.hist.record_all(st.sheet()?, args, format!("unmerge {args}"))?;
             st.sheet()?.range(args)?.unmerge()?;
             println!("已取消合并 {args}");
         }
@@ -512,8 +543,90 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
             let n = kill_all(st.engine)?;
             println!("已结束 {} 个 {} 进程", n, st.engine.exe_name());
         }
+        "undo" => {
+            let n: usize = if args.is_empty() {
+                1
+            } else {
+                args.parse()
+                    .map_err(|_| anyhow::anyhow!("步数应为正整数（得到 '{args}'），用法: undo [步数]"))?
+            };
+            if n == 0 {
+                bail!("步数至少为 1");
+            }
+            let wb = st.wb()?;
+            for i in 0..n {
+                match st.hist.undo(wb) {
+                    Ok(d) => println!("已撤销: {d}"),
+                    Err(e) => {
+                        if i == 0 {
+                            return Err(e);
+                        }
+                        println!("（已撤销 {i} 步后停止: {e:#}）");
+                        break;
+                    }
+                }
+            }
+        }
+        "history" => match args {
+            "" => {
+                if st.hist.is_empty() {
+                    println!("历史为空（修改类命令会自动记录，undo 撤销）");
+                }
+                for line in st.hist.summary().iter().rev() {
+                    println!("  {line}");
+                }
+            }
+            "clear" => {
+                let n = st.hist.len();
+                st.hist.clear();
+                println!("已清空 {n} 条历史");
+            }
+            other => bail!("用法: history [clear]（得到 '{other}'）"),
+        },
         "raw" => raw_cmd(st, args)?,
         other => bail!("未知命令 '{other}'，输入 help 查看命令列表"),
+    }
+    Ok(())
+}
+
+/// ev 命令：Application 级事件订阅（无参查看 / on 订阅 / poll 取事件 / state 快照 / off 退订）。
+fn ev_cmd(st: &mut State, args: &str) -> Result<()> {
+    let sub = first(args);
+    match sub {
+        "" => {
+            println!(
+                "{}（ev on 订阅 / ev poll 取事件 / ev state 快照 / ev off 退订）",
+                if st.ev.is_some() { "事件订阅中" } else { "未订阅事件" }
+            );
+        }
+        "on" => {
+            if st.ev.is_some() {
+                bail!("已订阅事件：ev poll 取事件，ev off 退订");
+            }
+            let app = st.app()?;
+            let mon = EventMonitor::start(app)?;
+            st.ev = Some(mon);
+            println!("已订阅事件（工作簿开关/激活、工作表激活、选区变化、单元格修改等），ev poll 查看");
+        }
+        "poll" => {
+            let mon = st.ev.as_ref().ok_or_else(|| anyhow::anyhow!("未订阅事件：先执行 ev on"))?;
+            let evs = mon.poll();
+            if evs.is_empty() {
+                println!("（无新事件）");
+            }
+            for e in evs {
+                println!("{e}");
+            }
+        }
+        "state" => println!("{}", st.app()?.state()?),
+        "off" => {
+            if st.ev.take().is_some() {
+                println!("已退订事件");
+            } else {
+                println!("当前未订阅事件");
+            }
+        }
+        _ => bail!("用法: ev on（订阅）/ ev poll（取事件）/ ev state（状态快照）/ ev off（退订）"),
     }
     Ok(())
 }
@@ -531,6 +644,13 @@ fn font_cmd(st: &State, args: &str) -> Result<()> {
     } else {
         None
     };
+    if val.is_some() {
+        if !matches!(prop, "bold" | "italic" | "underline" | "size" | "color" | "name") {
+            bail!("未知字体属性 '{prop}'，可选 bold|italic|underline|size|color|name");
+        }
+        st.hist
+            .record_fmt(st.sheet()?, p[0], format!("font {} {prop}", p[0]))?;
+    }
     match font_prop(&f, prop, val.as_deref())? {
         Some(v) => println!("{prop} = {v}"),
         None => println!("已设置 {} 字体 {prop}", p[0]),
@@ -578,6 +698,13 @@ fn align_cmd(st: &State, args: &str) -> Result<()> {
     }
     let prop = p[1];
     let val = p.get(2..).map(|s| s.join(" "));
+    if val.is_some() {
+        if !matches!(prop, "h" | "v" | "wrap" | "indent" | "orient" | "shrink") {
+            bail!("未知属性 '{prop}'，可选 h|v|wrap|indent|orient|shrink");
+        }
+        st.hist
+            .record_fmt(st.sheet()?, p[0], format!("align {} {prop}", p[0]))?;
+    }
     match (prop, val.as_deref()) {
         ("h", Some(v)) => r.set_alignment(Some(parse_h(v)?), None, None)?,
         ("v", Some(v)) => r.set_alignment(None, Some(parse_v(v)?), None)?,
@@ -604,6 +731,7 @@ fn size_cmd(st: &State, args: &str) -> Result<()> {
     match p.get(1).copied() {
         None => println!("列宽={}  行高={}", r.col_width()?, r.row_height()?),
         Some("fit") => {
+            st.hist.record_fmt(st.sheet()?, p[0], format!("size {} fit", p[0]))?;
             r.auto_fit()?;
             println!("已自适应 {}（列宽/行高）", p[0]);
         }
@@ -612,6 +740,7 @@ fn size_cmd(st: &State, args: &str) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("用法: size {} w <列宽>", p[0]))?
                 .parse()
                 .map_err(|_| anyhow::anyhow!("列宽应为数字（单位：字符）"))?;
+            st.hist.record_fmt(st.sheet()?, p[0], format!("size {} w", p[0]))?;
             r.set_col_width(w)?;
             println!("已设置 {} 列宽: {w}", p[0]);
         }
@@ -620,6 +749,7 @@ fn size_cmd(st: &State, args: &str) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("用法: size {} h <行高>", p[0]))?
                 .parse()
                 .map_err(|_| anyhow::anyhow!("行高应为数字（单位：磅）"))?;
+            st.hist.record_fmt(st.sheet()?, p[0], format!("size {} h", p[0]))?;
             r.set_row_height(h)?;
             println!("已设置 {} 行高: {h}", p[0]);
         }
@@ -655,14 +785,25 @@ fn chars_cmd(st: &State, args: &str) -> Result<()> {
             );
         }
         (Some("text"), Some(v)) => {
+            st.hist
+                .record(st.sheet()?, p[0], format!("chars {} text", p[0]))?;
             r.set_char_text(start, len, &v.replace("\\n", "\n"))?;
             println!("已替换 {} 第{start}起{len}字符", p[0]);
         }
         (Some("text"), None) => println!("text = {}", r.char_text(start, len)?),
-        (Some(prop), v) => match font_prop(&r.char_font(start, len)?, prop, v)? {
-            Some(s) => println!("{prop} = {s}"),
-            None => println!("已设置 {} 第{start}起{len}字符 {prop}", p[0]),
-        },
+        (Some(prop), v) => {
+            if v.is_some() {
+                if !matches!(prop, "bold" | "italic" | "underline" | "size" | "color" | "name") {
+                    bail!("未知字体属性 '{prop}'，可选 bold|italic|underline|size|color|name|text");
+                }
+                st.hist
+                    .record_fmt(st.sheet()?, p[0], format!("chars {} {prop}", p[0]))?;
+            }
+            match font_prop(&r.char_font(start, len)?, prop, v)? {
+                Some(s) => println!("{prop} = {s}"),
+                None => println!("已设置 {} 第{start}起{len}字符 {prop}", p[0]),
+            }
+        }
     }
     Ok(())
 }
