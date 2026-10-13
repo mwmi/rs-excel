@@ -58,7 +58,9 @@ struct FormatSnapshot {
     font_size: Option<f64>,
     font_color: Option<u32>,
     font_name: Option<String>,
-    interior_color: Option<u32>,
+    /// 填充三态，见 [`crate::style::Interior::fill`]：`None` = 混合（跳过不还原），
+    /// `Some(None)` = 整块无填充（还原成「无填充」），`Some(Some(色))` = 还原该填充色。
+    interior: Option<Option<u32>>,
 }
 
 /// 单条撤销记录的逆向操作（= 应用它就把改动反做一遍）。
@@ -353,7 +355,7 @@ fn snap_formats(ws: &Worksheet, addr: &str) -> Result<FormatSnapshot> {
         font_size: f.as_ref().and_then(|f| f.size().ok()),
         font_color: f.as_ref().and_then(|f| f.color().ok()),
         font_name: f.as_ref().and_then(|f| f.name().ok()),
-        interior_color: rng.interior().ok().and_then(|x| x.color().ok()),
+        interior: rng.interior().ok().and_then(|x| x.fill()),
     })
 }
 
@@ -484,10 +486,15 @@ fn apply_formats(rng: &Range, s: &FormatSnapshot) -> Result<()> {
             let _ = f.set_name(v);
         }
     }
-    if let Some(v) = s.interior_color {
-        if let Ok(interior) = rng.interior() {
+    // 填充按三态还原：无填充要清掉（否则撤销后填色还留在表上），混合则原样不动
+    match (s.interior, rng.interior()) {
+        (Some(None), Ok(interior)) => {
+            let _ = interior.clear();
+        }
+        (Some(Some(v)), Ok(interior)) => {
             let _ = interior.set_color(v);
         }
+        _ => {}
     }
     Ok(())
 }

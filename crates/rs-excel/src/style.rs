@@ -79,7 +79,7 @@ impl Font {
     }
 }
 
-/// 填充（Range.Interior）。无填充时读色返回 0x40000000 系值，设置后正常。
+/// 填充（Range.Interior）。
 pub struct Interior {
     raw: IDispatchWrapper,
 }
@@ -97,6 +97,20 @@ impl Interior {
     /// 填充色（OLE 格式）。
     pub fn color(&self) -> Result<u32> {
         Ok(self.raw.get("Color")?.int()? as u32)
+    }
+
+    /// 整块填充状态的三态：`Some(None)` = 整块无填充，`Some(Some(色))` = 整块同一填充色，
+    /// `None` = 混合/读不出。
+    ///
+    /// **判整块必须看 `Pattern`，不能只看 `Color`**：区域里填充不一致时
+    /// MS Excel 的 `Interior.Color` 返回 **0**（会被当成黑色填充），WPS 则返回 Null。
+    /// `Pattern` 在两家引擎下混合时都是 Null，整块一致时才有值（xlNone = -4142 / 1~18）。
+    pub fn fill(&self) -> Option<Option<u32>> {
+        match self.raw.get("Pattern").ok().and_then(|v| v.int().ok()) {
+            Some(-4142) => Some(None), // xlNone：整块无填充
+            Some(p) if p != 0 => self.color().ok().map(Some),
+            _ => None, // Null（混合）或 0：取不到统一值，调用方跳过即可
+        }
     }
 
     /// 设置填充色（用 `rs_excel::rgb(r, g, b)` 构造）。
