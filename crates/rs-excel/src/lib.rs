@@ -28,6 +28,8 @@
 //!   sheet.raw().call("PageSetup", vec![])?.idispatch()?.put("Zoom", vec![false.into()])?;
 //!   ```
 //! - **联动链路**：`range` → `font()` / `interior()` / `borders()` → 各自属性设置；
+//!   `range.format_conditions()` 或 `cond_value` / `cond_formula` / `cond_text` /
+//!   `cond_color_scale` / `cond_data_bar` / `cond_icon` 等一次性方法 → 条件格式规则增删查；
 //!   `worksheet.page_setup()` → 页边距/纸张/方向/打印区域/缩放/页眉页脚/打印标题；
 //!   `worksheet.shapes()` → 形状/图片/文本框的增删改查、外观、文本与批量操作。
 //! - **VBA 双通道**：简单操作走内置 API；复杂操作走 `Vba::run_macro`（无需设置）
@@ -54,6 +56,7 @@
 //! - **颜色格式**：COM 内部为 OLE 格式 `0x00BBGGRR`，统一用 [`rgb`] 助手构造。
 
 pub mod com;
+pub mod condfmt;
 pub mod engine;
 pub mod error;
 pub mod events;
@@ -74,6 +77,7 @@ mod worksheet;
 pub mod prelude {
     pub use crate::app::{App, CalcMode, WindowInfo, WindowState};
     pub use crate::chart::{Chart, ChartKind};
+    pub use crate::condfmt::{CondFormat, CondOp, CondText, DateOp, FormatCondition, FormatConditions, IconSet};
     pub use crate::com::dispatch::IDispatchWrapper;
     pub use crate::com::variant::{CellValue, ComValue};
     pub use crate::engine::{ConnectMode, Engine};
@@ -99,6 +103,7 @@ pub mod prelude {
 pub use app::{App, CalcMode, WindowInfo, WindowState};
 pub use chart::{Chart, ChartKind};
 pub use com::variant::{CellValue, ComValue};
+pub use condfmt::{CondFormat, CondOp, CondText, DateOp, FormatCondition, FormatConditions, IconSet};
 pub use engine::{ConnectMode, Engine};
 pub use error::{rgb, ExcelError};
 pub use events::{AppState, EventMonitor, ExcelEvent};
