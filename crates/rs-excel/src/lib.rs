@@ -92,7 +92,7 @@ pub mod prelude {
         type_name, AlignKind, AutoShapeKind, ConnectorKind, DashStyle, DistributeKind, FlipDir,
         Placement, Shape, ShapeInfo, ShapeRange, Shapes, ZOrderCmd,
     };
-    pub use crate::style::{Borders, Font, Interior};
+    pub use crate::style::{Borders, EdgeStyle, Font, Interior};
     pub use crate::vba::{Vba, VbaStatus};
     pub use crate::workbook::{FileFormat, SheetInfo, Workbook, WorkbookInfo};
     pub use crate::worksheet::Worksheet;
@@ -116,7 +116,7 @@ pub use shape::{
     type_name, AlignKind, AutoShapeKind, ConnectorKind, DashStyle, DistributeKind, FlipDir,
     Placement, Shape, ShapeInfo, ShapeRange, Shapes, ZOrderCmd,
 };
-pub use style::{Borders, Font, Interior};
+pub use style::{Borders, EdgeStyle, Font, Interior};
 pub use vba::{Vba, VbaStatus};
 pub use workbook::{FileFormat, SheetInfo, Workbook, WorkbookInfo};
 pub use worksheet::Worksheet;

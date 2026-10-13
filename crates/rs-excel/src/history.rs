@@ -20,7 +20,7 @@
 //! - 形状/图表/页面设置/删除工作表不在撤销范围；
 //! - 类数字文本（如 "001"）写回时会被引擎重定型为数字；
 //! - 行列插入/删除经整表内容快照恢复值/公式，被移动区域的格式不还原；
-//! - `clear formats` 撤销后边框不还原（边框不入格式快照）。
+//! - 格式快照里的填充/边框，区域里本来就不一致（混合）时按「跳过」处理，不猜一个值去还原。
 
 use anyhow::{bail, Result};
 use std::cell::RefCell;
@@ -28,6 +28,7 @@ use std::cell::RefCell;
 use crate::com::variant::CellValue;
 use crate::error::ExcelError;
 use crate::range::Range;
+use crate::style::EdgeStyle;
 use crate::worksheet::{num_to_col, parse_addr, parse_tsv, Worksheet};
 use crate::workbook::Workbook;
 
@@ -61,6 +62,8 @@ struct FormatSnapshot {
     /// 填充三态，见 [`crate::style::Interior::fill`]：`None` = 混合（跳过不还原），
     /// `Some(None)` = 整块无填充（还原成「无填充」），`Some(Some(色))` = 还原该填充色。
     interior: Option<Option<u32>>,
+    /// 六条边各自的边框状态，见 [`crate::style::Borders::snapshot`]；空 = 读不到边框对象。
+    borders: Vec<Option<EdgeStyle>>,
 }
 
 /// 单条撤销记录的逆向操作（= 应用它就把改动反做一遍）。
@@ -356,6 +359,7 @@ fn snap_formats(ws: &Worksheet, addr: &str) -> Result<FormatSnapshot> {
         font_color: f.as_ref().and_then(|f| f.color().ok()),
         font_name: f.as_ref().and_then(|f| f.name().ok()),
         interior: rng.interior().ok().and_then(|x| x.fill()),
+        borders: rng.borders().map(|b| b.snapshot()).unwrap_or_default(),
     })
 }
 
@@ -495,6 +499,10 @@ fn apply_formats(rng: &Range, s: &FormatSnapshot) -> Result<()> {
             let _ = interior.set_color(v);
         }
         _ => {}
+    }
+    // 边框逐边还原（快照为空 = 当时读不到边框对象，跳过）
+    if let Ok(borders) = rng.borders() {
+        borders.restore(&s.borders);
     }
     Ok(())
 }

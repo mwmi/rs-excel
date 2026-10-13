@@ -3,7 +3,6 @@
 use anyhow::Result;
 
 use crate::com::dispatch::IDispatchWrapper;
-use crate::error::ExcelError;
 
 /// 字体（Range.Font）。
 pub struct Font {
@@ -135,6 +134,10 @@ const EDGES: [i32; 6] = [7, 8, 9, 10, 11, 12];
 /// xlEdge 常量：仅外框
 const OUTLINE: [i32; 4] = [7, 8, 9, 10];
 
+/// 一条边的边框状态：`(xlLineStyle, xlBorderWeight, OLE 色)`。
+/// 线型 = `xlNone`(-4142) 表示这条边没有边框。
+pub type EdgeStyle = (i32, i32, u32);
+
 impl Borders {
     pub(crate) fn from_raw(raw: IDispatchWrapper) -> Self {
         Self { raw }
@@ -145,14 +148,50 @@ impl Borders {
         &self.raw
     }
 
-    fn apply(&self, edges: &[i32], line_style: i32, weight: i32, ole_color: u32) -> Result<()> {
-        for edge in edges {
-            let b = self.raw.call("Item", vec![(*edge).into()])?.idispatch()?;
-            b.put("LineStyle", vec![line_style.into()])?;
+    /// 写一条边；`line_style` 为 `xlNone` 时只清线型（粗细/色对无边框没有意义）。
+    fn put_edge(&self, edge: i32, line_style: i32, weight: i32, ole_color: u32) -> Result<()> {
+        let b = self.raw.call("Item", vec![edge.into()])?.idispatch()?;
+        b.put("LineStyle", vec![line_style.into()])?;
+        if line_style != -4142 {
             b.put("Weight", vec![weight.into()])?;
             b.put("Color", vec![ole_color.into()])?;
         }
         Ok(())
+    }
+
+    fn apply(&self, edges: &[i32], line_style: i32, weight: i32, ole_color: u32) -> Result<()> {
+        for edge in edges {
+            self.put_edge(*edge, line_style, weight, ole_color)?;
+        }
+        Ok(())
+    }
+
+    /// 六条边各自的边框状态，顺序同 `EDGES`；某条边读不出统一值（区域里不一致）时为 `None`。
+    ///
+    /// **判据取 `LineStyle` 读不读得出，不能取 `Color`**：混合时 WPS 的 `LineStyle` 返回 Null、
+    /// 而 `Color` 给出 0，拿 0 当颜色记下来就会把整块还原成黑框（与 `Interior::fill` 同一坑）。
+    pub fn snapshot(&self) -> Vec<Option<EdgeStyle>> {
+        EDGES
+            .iter()
+            .map(|edge| {
+                let b = self.raw.call("Item", vec![(*edge).into()]).ok()?.idispatch().ok()?;
+                Some((
+                    b.get("LineStyle").ok()?.int().ok()?,
+                    b.get("Weight").ok()?.int().ok()?,
+                    b.get("Color").ok()?.int().ok()? as u32,
+                ))
+            })
+            .collect()
+    }
+
+    /// 按 [`snapshot`](Self::snapshot) 的结果逐边还原（`None` 的边跳过）。
+    /// 写不进去的边跳过 —— 边框只是外观，不该拖垮整条撤销。
+    pub fn restore(&self, states: &[Option<EdgeStyle>]) {
+        for (edge, state) in EDGES.iter().zip(states) {
+            if let Some((line_style, weight, color)) = state {
+                let _ = self.put_edge(*edge, *line_style, *weight, *color);
+            }
+        }
     }
 
     /// 全部加边框（四边+内部网格线）。默认参数：`set_all(1, 2, rgb(0,0,0))`
@@ -168,12 +207,7 @@ impl Borders {
 
     /// 清除全部边框。
     pub fn clear(&self) -> Result<()> {
-        for edge in EDGES {
-            let b = self.raw.call("Item", vec![edge.into()])?.idispatch()?;
-            // xlLineStyleNone = -4142
-            b.put("LineStyle", vec![(-4142i32).into()])
-                .map_err(|e| ExcelError::hint(e, "清除边框失败"))?;
-        }
-        Ok(())
+        // xlLineStyleNone = -4142
+        self.apply(&EDGES, -4142, 2, 0)
     }
 }

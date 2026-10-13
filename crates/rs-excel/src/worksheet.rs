@@ -228,11 +228,14 @@ impl Worksheet {
         anchor: &str,
     ) -> Result<Chart> {
         let shapes = self.raw.get_obj("Shapes", "Shapes")?;
+        let src = self.range(data_range)?;
         let a = self.range(anchor)?;
         let left = a.raw().get("Left")?.float()?;
         let top = a.raw().get("Top")?.float()?;
-        let width = a.raw().get("Width")?.float()? * 3.0;
-        let height = a.raw().get("Height")?.float()? * 12.0;
+        // 尺寸按数据形状给：类目越多越宽、序列越多越高，再兜一个下限。
+        // 只按锚点单元格 ×3/×12 算出来只约 2×2.5 英寸，标题、图例、轴标签会全叠在一起（实报）
+        let width = (src.columns()? as f64 * 62.0).clamp(460.0, 900.0);
+        let height = (src.rows()? as f64 * 20.0).clamp(300.0, 560.0);
         // AddChart2(Style=-1, XlChartType, Left, Top, Width, Height)；旧引擎回退 AddChart
         let shape = match shapes.call(
             "AddChart2",
@@ -258,7 +261,6 @@ impl Worksheet {
             )?,
         };
         let chart = shape.idispatch_child("chart")?.get_obj("Chart", "Chart")?;
-        let src = self.range(data_range)?;
         let src_obj = ComValue::Obj(src.raw().disp.clone());
         // SetSourceData：优先命名参数 Source:=，失败回退位置参数
         if chart
