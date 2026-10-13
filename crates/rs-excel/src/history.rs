@@ -61,15 +61,18 @@ struct FormatSnapshot {
     interior_color: Option<u32>,
 }
 
-/// 单条撤销记录的逆向操作。
+/// 单条撤销记录的逆向操作（= 应用它就把改动反做一遍）。
+/// 每个变体都是可逆的：撤销时应用它，重做时应用它的反向（见 [`snapshot_like`]）。
 enum UndoOp {
     Cells(CellsSnapshot),
     Formats(FormatSnapshot),
     Both(CellsSnapshot, FormatSnapshot),
-    /// 撤销 = 删除该工作表
-    SheetAdded { name: String },
-    /// 撤销 = 改回旧名
-    SheetRenamed { old: String, new: String },
+    /// 应用到表上 = 删除该工作表（「新增工作表」的逆向）。
+    SheetDelete { name: String },
+    /// 应用到表上 = 新建一张空表（删表被撤销后再恢复用；内容由后续 Cells 记录补回）。
+    SheetCreate { name: String },
+    /// 应用到表上 = 把 `from` 改名为 `to`。
+    SheetRename { from: String, to: String },
 }
 
 /// 一条历史记录（含操作描述）。
@@ -85,9 +88,8 @@ impl std::fmt::Display for UndoEntry {
             UndoOp::Cells(c) => write!(f, " @ {}!{}", c.sheet, c.addr),
             UndoOp::Formats(x) => write!(f, " @ {}!{}", x.sheet, x.addr),
             UndoOp::Both(c, _) => write!(f, " @ {}!{}", c.sheet, c.addr),
-            UndoOp::SheetAdded { name } | UndoOp::SheetRenamed { new: name, .. } => {
-                write!(f, "（工作表 {name}）")
-            }
+            UndoOp::SheetDelete { name } | UndoOp::SheetCreate { name } => write!(f, "（工作表 {name}）"),
+            UndoOp::SheetRename { from, to } => write!(f, "（工作表 {from} → {to}）"),
         }
     }
 }
@@ -209,23 +211,24 @@ impl History {
         self.record(ws, &format!("{anchor}:{end}"), desc)
     }
 
-    /// 记录"新增工作表"（撤销 = 删除该表）。
+    /// 记录"新增工作表"（撤销 = 删除该表，重做 = 重新建一张空表）。
     pub fn record_sheet_added(&self, name: impl Into<String>, desc: impl Into<String>) {
-        self.push(desc.into(), UndoOp::SheetAdded { name: name.into() });
+        self.push(desc.into(), UndoOp::SheetDelete { name: name.into() });
     }
 
-    /// 记录"重命名工作表"（撤销 = 改回旧名）。
+    /// 记录"重命名工作表"（撤销 = 改回旧名，重做 = 再改成新名）。
     pub fn record_sheet_renamed(
         &self,
         old: impl Into<String>,
         new: impl Into<String>,
         desc: impl Into<String>,
     ) {
+        // 记的是「从新名改回旧名」这一步：撤销直接应用它，重做应用它的反向
         self.push(
             desc.into(),
-            UndoOp::SheetRenamed {
-                old: old.into(),
-                new: new.into(),
+            UndoOp::SheetRename {
+                from: new.into(),
+                to: old.into(),
             },
         );
     }
@@ -234,62 +237,52 @@ impl History {
 
     /// 撤销最近一条记录的操作，返回单行描述（如 `tset A1:C5 @ Sheet1!A1:C5`）。
     pub fn undo(&self, wb: &Workbook) -> Result<String> {
-        let Some(entry) = self.entries.borrow_mut().pop() else {
-            return Err(ExcelError::new("undo", "history", "历史记录为空，没有可撤销的操作")
+        self.swap(wb, &self.entries, &self.redo)?.ok_or_else(|| {
+            ExcelError::new("undo", "history", "历史记录为空，没有可撤销的操作")
                 .with_hint("仅记录过的操作可撤销（修改类操作需先 record）；用 summary() 查看历史")
-                .into());
-        };
-        let desc = entry.to_string();
-        // 撤销前先把目标区域的「当前状态」拍下来，它就是要恢复回去的那一版
-        let forward = self.look_back(wb, &self.entries, entry)?;
-        // **失败要把条目放回去**：否则调用方一重试就会撤到下一条（撤错东西），
-        // 用户看到的也是"这条已经撤过了"的假象。WPS 在连续批量操作时会偶发
-        // 0x80020009（"发生意外"，通常是服务端正忙），正是靠回退重试来救的
-        if let Err(e) = restore(wb, &forward.0.op) {
-            self.append(&self.entries, forward.0);
-            return Err(e);
-        }
-        if let Some(op) = forward.1 {
-            self.append(&self.redo, UndoEntry { desc: desc.clone(), op });
-        }
-        Ok(desc)
+                .into()
+        })
     }
 
-    /// 恢复最近一次被撤销的操作（重做），返回单行描述。
+    /// 恢复最近一次被撤销的操作（重做），返回单行描述。与 [`undo`](Self::undo) 完全对称。
     pub fn redo(&self, wb: &Workbook) -> Result<String> {
-        let Some(entry) = self.redo.borrow_mut().pop() else {
-            return Err(ExcelError::new("redo", "history", "没有可恢复的操作")
+        self.swap(wb, &self.redo, &self.entries)?.ok_or_else(|| {
+            ExcelError::new("redo", "history", "没有可恢复的操作")
                 .with_hint("只有撤销过的操作能恢复；撤销后又做了新的修改，恢复即作废")
-                .into());
-        };
-        let desc = entry.to_string();
-        // 与 undo 镜像：恢复前把「当前状态」拍下来，放回撤销栈就能再撤回去
-        let back = self.look_back(wb, &self.redo, entry)?;
-        if let Err(e) = restore(wb, &back.0.op) {
-            self.append(&self.redo, back.0);
-            return Err(e);
-        }
-        if let Some(op) = back.1 {
-            self.append(&self.entries, UndoEntry { desc: desc.clone(), op });
-        }
-        Ok(desc)
+                .into()
+        })
     }
 
-    /// 取出条目 `entry` 的「当前状态」快照（= 反向应用后能回到的那一版）。
-    /// 快照失败就把 `entry` 放回 `stack` 并原样返回错误（调用方不必再管）。
-    fn look_back(
+    /// 撤销 / 恢复的公共过程（两栈对称）：从 `from` 弹一条，按其逆向 `restore`；
+    /// 成功再把目标区域「当前状态」的反向记录压入 `to`，失败则把条目放回 `from`。
+    ///
+    /// **失败要把条目放回去**：否则调用方一重试就会动到下一条（撤错东西），用户看到的
+    /// 也是"这条已经撤过了"的假象。WPS 在连续批量操作时会偶发 0x80020009（"发生意外"，
+    /// 通常是服务端正忙），正是靠回退重试来救的。返回 `Ok(None)` = 栈已空。
+    fn swap(
         &self,
         wb: &Workbook,
-        stack: &RefCell<Vec<UndoEntry>>,
-        entry: UndoEntry,
-    ) -> Result<(UndoEntry, Option<UndoOp>)> {
-        match snapshot_like(wb, &entry.op) {
-            Ok(op) => Ok((entry, op)),
+        from: &RefCell<Vec<UndoEntry>>,
+        to: &RefCell<Vec<UndoEntry>>,
+    ) -> Result<Option<String>> {
+        let Some(entry) = from.borrow_mut().pop() else {
+            return Ok(None);
+        };
+        let desc = entry.to_string();
+        // 先把目标区域的「当前状态」拍下来，它就是要恢复回去的那一版
+        let forward = match snapshot_like(wb, &entry.op) {
+            Ok(op) => op,
             Err(e) => {
-                self.append(stack, entry);
-                Err(e)
+                self.append(from, entry);
+                return Err(e);
             }
+        };
+        if let Err(e) = restore(wb, &entry.op) {
+            self.append(from, entry);
+            return Err(e);
         }
+        self.append(to, UndoEntry { desc: desc.clone(), op: forward });
+        Ok(Some(desc))
     }
 
     /// 记录一次新操作：**旧的恢复点作废**（撤销后又改，就回不去了 —— 与 Word/Excel 一致）
@@ -395,7 +388,7 @@ fn restore(wb: &Workbook, op: &UndoOp) -> Result<()> {
             }
             apply_formats(&rng, f)
         }
-        UndoOp::SheetAdded { name } => {
+        UndoOp::SheetDelete { name } => {
             let ws = target_sheet(wb, name)?;
             // 删表可能弹确认框：临时关告警，结束恢复
             let app = wb.raw().get("Application")?.idispatch()?;
@@ -407,7 +400,10 @@ fn restore(wb: &Workbook, op: &UndoOp) -> Result<()> {
             }
             res
         }
-        UndoOp::SheetRenamed { old, new } => target_sheet(wb, new)?.rename(old),
+        // 建空表：内容由恢复栈里排在它后面的 Cells 记录补回（撤销时删表是最后一步，
+        // 恢复时建表就是第一步 —— 两栈后进先出正好对上）
+        UndoOp::SheetCreate { name } => wb.add_sheet(name, None).map(|_| ()),
+        UndoOp::SheetRename { from, to } => target_sheet(wb, from)?.rename(to),
     }
 }
 
@@ -499,17 +495,21 @@ fn apply_formats(rng: &Range, s: &FormatSnapshot) -> Result<()> {
 /// 按某条记录的**目标区域**取「当前状态」快照，做成一条可反向应用的条目
 /// （撤销 ⇄ 恢复互换用）。
 ///
-/// 工作表增删 / 改名没有可逆快照（重做一张删掉的表也恢复不出内容），返回 `None`：
-/// 那类记录撤销后不进恢复栈（界面上表现为「这条不能恢复」）。
-fn snapshot_like(wb: &Workbook, op: &UndoOp) -> Result<Option<UndoOp>> {
+/// 区域类（Cells/Formats/Both）拍当前状态；表结构类没有可读的区域快照，
+/// 直接把动作反过来即可 —— 这样撤销「新增工作表」后那条会进恢复栈，重做时能建回空表，
+/// 排在它后面的内容记录也就能照常恢复（否则恢复栈里那些记录会指向一张已删掉的表，
+/// 一点恢复就报「工作表不存在」，且条目反复留在栈里永远撤不掉）。
+fn snapshot_like(wb: &Workbook, op: &UndoOp) -> Result<UndoOp> {
     Ok(match op {
-        UndoOp::Cells(c) => Some(UndoOp::Cells(snap_cells(&target_sheet(wb, &c.sheet)?, &c.addr)?)),
-        UndoOp::Formats(f) => Some(UndoOp::Formats(snap_formats(&target_sheet(wb, &f.sheet)?, &f.addr)?)),
-        UndoOp::Both(c, f) => Some(UndoOp::Both(
+        UndoOp::Cells(c) => UndoOp::Cells(snap_cells(&target_sheet(wb, &c.sheet)?, &c.addr)?),
+        UndoOp::Formats(f) => UndoOp::Formats(snap_formats(&target_sheet(wb, &f.sheet)?, &f.addr)?),
+        UndoOp::Both(c, f) => UndoOp::Both(
             snap_cells(&target_sheet(wb, &c.sheet)?, &c.addr)?,
             snap_formats(&target_sheet(wb, &f.sheet)?, &f.addr)?,
-        )),
-        UndoOp::SheetAdded { .. } | UndoOp::SheetRenamed { .. } => None,
+        ),
+        UndoOp::SheetDelete { name } => UndoOp::SheetCreate { name: name.clone() },
+        UndoOp::SheetCreate { name } => UndoOp::SheetDelete { name: name.clone() },
+        UndoOp::SheetRename { from, to } => UndoOp::SheetRename { from: to.clone(), to: from.clone() },
     })
 }
 
