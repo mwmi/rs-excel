@@ -77,7 +77,7 @@ mod worksheet;
 pub mod prelude {
     pub use crate::app::{App, CalcMode, WindowInfo, WindowState};
     pub use crate::chart::{Chart, ChartKind};
-    pub use crate::condfmt::{CondFormat, CondOp, CondText, DateOp, FormatCondition, FormatConditions, IconSet};
+    pub use crate::condfmt::{CondFormat, CondOp, CondSnap, CondText, DateOp, FormatCondition, FormatConditions, IconSet};
     pub use crate::com::dispatch::IDispatchWrapper;
     pub use crate::com::variant::{CellValue, ComValue};
     pub use crate::engine::{ConnectMode, Engine};

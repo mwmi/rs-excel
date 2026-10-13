@@ -56,6 +56,21 @@ impl CondOp {
             Self::LessEqual => 8,
         }
     }
+
+    /// 由 COM 读回的 `Operator` 常量反推（读不出按 Equal）。
+    pub fn from_code(code: Option<i32>) -> Self {
+        match code {
+            Some(1) => Self::Between,
+            Some(2) => Self::NotBetween,
+            Some(3) => Self::Equal,
+            Some(4) => Self::NotEqual,
+            Some(5) => Self::Greater,
+            Some(6) => Self::Less,
+            Some(7) => Self::GreaterEqual,
+            Some(8) => Self::LessEqual,
+            _ => Self::Equal,
+        }
+    }
 }
 
 /// 文本匹配方式（xlTextOperator）。
@@ -74,6 +89,16 @@ impl CondText {
             Self::NotContains => 1,
             Self::BeginsWith => 2,
             Self::EndsWith => 3,
+        }
+    }
+
+    /// 由 COM 读回的 `TextOperator` 常量反推（读不出按 Contains）。
+    pub fn from_code(code: Option<i32>) -> Self {
+        match code {
+            Some(1) => Self::NotContains,
+            Some(2) => Self::BeginsWith,
+            Some(3) => Self::EndsWith,
+            _ => Self::Contains,
         }
     }
 }
@@ -200,6 +225,36 @@ fn apply_format(cond: &IDispatchWrapper, fmt: &CondFormat) -> Result<()> {
 
 // ── 集合与单条规则 ──
 
+/// 一条条件格式规则的快照（读不出的项留空，重建时按缺省处理）。
+///
+/// 为什么要它：`FormatConditions` 没有克隆接口，想撤销「AI 加的条件格式」只能把每条
+/// 规则的判定与命中格式逐项读出来存着，撤销时先 `delete_all` 再逐条 `Add` 回来。
+#[derive(Clone, Debug, Default)]
+pub struct CondSnap {
+    /// xlFormatConditionType；`<= 0` = 这条没读出来，重建时跳过
+    pub type_code: i32,
+    pub operator: Option<i32>,
+    pub formula1: Option<String>,
+    pub formula2: Option<String>,
+    pub text_op: Option<i32>,
+    pub string: Option<String>,
+    pub dupe_unique: Option<i32>,
+    pub rank: Option<i32>,
+    pub percent: Option<bool>,
+    pub top_bottom: Option<i32>,
+    pub above_below: Option<i32>,
+    pub stop_if_true: Option<bool>,
+    pub fill: Option<u32>,
+    pub font_color: Option<u32>,
+    pub bold: Option<bool>,
+    /// 色阶的 2~3 个颜色（低→中→高）
+    pub scale_colors: Vec<u32>,
+    /// 数据条颜色
+    pub bar_color: Option<u32>,
+    /// 图标集代码
+    pub icon_set: Option<i32>,
+}
+
 /// 条件格式集合（Range.FormatConditions）。快速添加见 [`Range`] 的 `cond_xxx` 方法。
 pub struct FormatConditions {
     raw: IDispatchWrapper,
@@ -249,6 +304,16 @@ impl FormatConditions {
     pub fn delete_all(&self) -> Result<()> {
         self.raw.call("Delete", vec![]).map(|_| ())
     }
+
+    /// 快照全部规则（顺序即优先级顺序，供 [`Range::apply_conds`] 原样重建）。
+    pub fn snapshot(&self) -> Result<Vec<CondSnap>> {
+        let n = self.count()?.max(0);
+        let mut out = Vec::with_capacity(n as usize);
+        for i in 1..=n {
+            out.push(self.item(i)?.snapshot());
+        }
+        Ok(out)
+    }
 }
 
 /// 单条条件格式规则（FormatCondition）。
@@ -275,6 +340,90 @@ impl FormatCondition {
             .int()
             .ok()?;
         (c > 0 && c < 0x0100_0000).then_some(c as u32)
+    }
+
+    /// 命中字色（未设置返回 None）。
+    pub fn font_color(&self) -> Option<u32> {
+        let c = self
+            .raw
+            .get("Font")
+            .ok()?
+            .idispatch()
+            .ok()?
+            .get("Color")
+            .ok()?
+            .int()
+            .ok()?;
+        (c > 0 && c < 0x0100_0000).then_some(c as u32)
+    }
+
+    /// 命中加粗（未设置返回 None）。
+    pub fn bold(&self) -> Option<bool> {
+        self.raw.get("Font").ok()?.idispatch().ok()?.get("Bold").and_then(|v| v.bool()).ok()
+    }
+
+    /// 快照本条规则（判定 + 命中格式），供 [`Range::apply_conds`] 重建。
+    pub fn snapshot(&self) -> CondSnap {
+        let int_of = |name: &str| self.raw.get(name).and_then(|v| v.int()).ok();
+        let txt_of = |name: &str| {
+            self.raw
+                .get(name)
+                .ok()
+                .and_then(|v| v.string().ok())
+                .filter(|s| !s.is_empty())
+        };
+        let mut snap = CondSnap {
+            type_code: int_of("Type").unwrap_or(0),
+            operator: int_of("Operator"),
+            formula1: txt_of("Formula1"),
+            formula2: txt_of("Formula2"),
+            text_op: int_of("TextOperator"),
+            string: txt_of("String"),
+            dupe_unique: int_of("DupeUnique"),
+            rank: int_of("Rank"),
+            percent: self.raw.get("Percent").and_then(|v| v.bool()).ok(),
+            top_bottom: int_of("TopBottom"),
+            above_below: int_of("AboveBelow"),
+            stop_if_true: self.raw.get("StopIfTrue").and_then(|v| v.bool()).ok(),
+            fill: self.fill_color(),
+            font_color: self.font_color(),
+            bold: self.bold(),
+            ..Default::default()
+        };
+        match snap.type_code {
+            // 色阶：逐个 ColorScaleCriteria 读 FormatColor（2 色阶梯没有第 3 个，读失败即止）
+            3 => {
+                for i in 1..=3 {
+                    let Ok(c) = self
+                        .raw
+                        .call("ColorScaleCriteria", vec![i.into()])
+                        .and_then(|v| v.idispatch())
+                        .and_then(|v| v.get_obj("FormatColor", "FormatColor"))
+                        .and_then(|v| v.get("Color"))
+                        .and_then(|v| v.int())
+                    else {
+                        break;
+                    };
+                    if c > 0 && c < 0x0100_0000 {
+                        snap.scale_colors.push(c as u32);
+                    }
+                }
+            }
+            // 数据条
+            4 => {
+                snap.bar_color = self
+                    .raw
+                    .get_obj("BarColor", "BarColor")
+                    .ok()
+                    .and_then(|v| v.get("Color").and_then(|v| v.int()).ok())
+                    .filter(|c| *c > 0 && *c < 0x0100_0000)
+                    .map(|c| c as u32);
+            }
+            // 图标集：常量或 IconSet 对象都试
+            6 => snap.icon_set = self.raw.get("IconSet").and_then(|v| v.int()).ok(),
+            _ => {}
+        }
+        snap
     }
 
     /// 单行描述：优先级、类型、条件公式、填充色。
@@ -357,6 +506,52 @@ impl Range {
     /// 删除本区域全部条件格式。
     pub fn clear_cond(&self) -> Result<()> {
         self.format_conditions()?.delete_all()
+    }
+
+    /// 写回条件格式快照（先清空本区域，再按快照顺序逐条重建 = 撤销/恢复条件格式用）。
+    ///
+    /// `type_code <= 0` 的条目跳过（当时就没读出来）；单条重建失败不影响其余条目 ——
+    /// 与格式快照还原同口径：外观类还原不该让整条撤销失败卡死栈。
+    pub fn apply_conds(&self, snaps: &[CondSnap]) -> Result<()> {
+        self.clear_cond()?;
+        for s in snaps {
+            if s.type_code <= 0 {
+                continue;
+            }
+            let fmt = CondFormat {
+                fill: s.fill,
+                font: s.font_color,
+                bold: s.bold,
+            };
+            let _ = match s.type_code {
+                1 => self.cond_value(
+                    CondOp::from_code(s.operator),
+                    s.formula1.as_deref().unwrap_or_default(),
+                    s.formula2.as_deref(),
+                    &fmt,
+                ),
+                2 => self.cond_formula(s.formula1.as_deref().unwrap_or_default(), &fmt),
+                9 => self.cond_text(CondText::from_code(s.text_op), s.string.as_deref().unwrap_or_default(), &fmt),
+                // xlDuplicate = 7 / xlUnique = 8
+                7 | 8 => self.cond_dupe(s.type_code == 8, &fmt),
+                5 => self.cond_top(
+                    s.rank.unwrap_or(10),
+                    s.percent.unwrap_or(false),
+                    s.top_bottom == Some(2),
+                    &fmt,
+                ),
+                12 => self.cond_average(s.above_below == Some(1), &fmt),
+                3 => self.cond_color_scale(
+                    s.scale_colors.first().copied().unwrap_or(0),
+                    s.scale_colors.get(1).copied().unwrap_or(0),
+                    s.scale_colors.get(2).copied(),
+                ),
+                4 => self.cond_data_bar(s.bar_color.unwrap_or(0x63BE7B)),
+                6 => self.cond_icon(IconSet::Code(s.icon_set.unwrap_or(3))),
+                _ => Ok(()),
+            };
+        }
+        Ok(())
     }
 
     /// 添加规则并应用命中格式（一次性方法的公共尾部）。

@@ -20,12 +20,14 @@
 //! - 形状/图表/页面设置/删除工作表不在撤销范围；
 //! - 类数字文本（如 "001"）写回时会被引擎重定型为数字；
 //! - 行列插入/删除经整表内容快照恢复值/公式，被移动区域的格式不还原；
-//! - 格式快照里的填充/边框，区域里本来就不一致（混合）时按「跳过」处理，不猜一个值去还原。
+//! - 格式快照里，区域填充混杂时会逐格细读（小区域才做，见 [`FILL_CELL_LIMIT`]）；
+//!   边框混杂时按「跳过」处理（不猜一个值去还原）。
 
 use anyhow::{bail, Result};
 use std::cell::RefCell;
 
 use crate::com::variant::CellValue;
+use crate::condfmt::CondSnap;
 use crate::error::ExcelError;
 use crate::range::Range;
 use crate::style::EdgeStyle;
@@ -59,11 +61,36 @@ struct FormatSnapshot {
     font_size: Option<f64>,
     font_color: Option<u32>,
     font_name: Option<String>,
-    /// 填充三态，见 [`crate::style::Interior::fill`]：`None` = 混合（跳过不还原），
-    /// `Some(None)` = 整块无填充（还原成「无填充」），`Some(Some(色))` = 还原该填充色。
-    interior: Option<Option<u32>>,
+    /// 填充（底纹），见 [`FillSnap`]。
+    fill: FillSnap,
     /// 六条边各自的边框状态，见 [`crate::style::Borders::snapshot`]；空 = 读不到边框对象。
     borders: Vec<Option<EdgeStyle>>,
+}
+
+/// 条件格式快照：某区域修改前的全部规则（空 = 当时没有规则，撤销即清空）。
+struct CondSnapshot {
+    sheet: String,
+    addr: String,
+    rules: Vec<CondSnap>,
+}
+
+/// 一次填充快照允许细分的格子上限：超过它（整列那种上百万格）不细读，只在整块一致时还原。
+/// 最坏情况（每一行内部都混杂）要逐格读，按 WPS 每次 COM 往返约 1ms 估，400 格 ≈ 1.5s 封顶。
+const FILL_CELL_LIMIT: i64 = 400;
+
+/// 填充（底纹）快照。逐项语义同 [`crate::style::Interior::fill`] 的三态。
+///
+/// 为什么要三态：整块读一次只在填充一致时给得出值（`Pattern`），混杂时是 Null。
+/// 而 AI 改底纹的区域常常正是混杂的（表头有底纹、表体没有），只记「混杂」就等于
+/// 撤销时什么都不做 —— 新刷的底纹撤不掉（用户实报）。
+enum FillSnap {
+    /// 整块同一状态：`Some(色)` = 同色，`None` = 整块无填充。
+    Uniform(Option<u32>),
+    /// 整块混杂：逐格记（行优先）。每格同样是 `Some(色)` / `None`（无填充），
+    /// 单格读不出来才是 `None` 外层（跳过该格）。`cols` 用于把下标还原成行列。
+    Cells { cols: i32, states: Vec<Option<Option<u32>>> },
+    /// 混杂且格子超过 [`FILL_CELL_LIMIT`]：不还原。
+    Skip,
 }
 
 /// 单条撤销记录的逆向操作（= 应用它就把改动反做一遍）。
@@ -72,6 +99,8 @@ enum UndoOp {
     Cells(CellsSnapshot),
     Formats(FormatSnapshot),
     Both(CellsSnapshot, FormatSnapshot),
+    /// 条件格式规则集（撤销 = 写回这一组；恢复 ⇄ 撤销互换时重拍当前规则）。
+    Conds(CondSnapshot),
     /// 应用到表上 = 删除该工作表（「新增工作表」的逆向）。
     SheetDelete { name: String },
     /// 应用到表上 = 新建一张空表（删表被撤销后再恢复用；内容由后续 Cells 记录补回）。
@@ -93,6 +122,7 @@ impl std::fmt::Display for UndoEntry {
             UndoOp::Cells(c) => write!(f, " @ {}!{}", c.sheet, c.addr),
             UndoOp::Formats(x) => write!(f, " @ {}!{}", x.sheet, x.addr),
             UndoOp::Both(c, _) => write!(f, " @ {}!{}", c.sheet, c.addr),
+            UndoOp::Conds(c) => write!(f, " @ {}!{}", c.sheet, c.addr),
             UndoOp::SheetDelete { name } | UndoOp::SheetCreate { name } => write!(f, "（工作表 {name}）"),
             UndoOp::SheetRename { from, to } => write!(f, "（工作表 {from} → {to}）"),
         }
@@ -190,6 +220,13 @@ impl History {
         let addr = ws.used_addr()?;
         let snap = snap_cells(ws, &addr)?;
         self.push(desc.into(), UndoOp::Cells(snap));
+        Ok(())
+    }
+
+    /// 记录条件格式快照（`cond_xxx` / `clear_cond` 前调用）。
+    pub fn record_cond(&self, ws: &Worksheet, addr: &str, desc: impl Into<String>) -> Result<()> {
+        let snap = snap_conds(ws, addr)?;
+        self.push(desc.into(), UndoOp::Conds(snap));
         Ok(())
     }
 
@@ -358,8 +395,18 @@ fn snap_formats(ws: &Worksheet, addr: &str) -> Result<FormatSnapshot> {
         font_size: f.as_ref().and_then(|f| f.size().ok()),
         font_color: f.as_ref().and_then(|f| f.color().ok()),
         font_name: f.as_ref().and_then(|f| f.name().ok()),
-        interior: rng.interior().ok().and_then(|x| x.fill()),
+        fill: snap_fill(&rng),
         borders: rng.borders().map(|b| b.snapshot()).unwrap_or_default(),
+    })
+}
+
+/// 条件格式快照：读该区域全部规则（读不出来时 rules 为空，撤销表现为清空该区域规则）。
+fn snap_conds(ws: &Worksheet, addr: &str) -> Result<CondSnapshot> {
+    let rng = ws.range(addr)?;
+    Ok(CondSnapshot {
+        sheet: ws.name()?,
+        addr: addr.to_string(),
+        rules: rng.format_conditions()?.snapshot().unwrap_or_default(),
     })
 }
 
@@ -409,6 +456,7 @@ fn restore(wb: &Workbook, op: &UndoOp) -> Result<()> {
         // 建空表：内容由恢复栈里排在它后面的 Cells 记录补回（撤销时删表是最后一步，
         // 恢复时建表就是第一步 —— 两栈后进先出正好对上）
         UndoOp::SheetCreate { name } => wb.add_sheet(name, None).map(|_| ()),
+        UndoOp::Conds(c) => target_range(wb, &c.sheet, &c.addr)?.apply_conds(&c.rules),
         UndoOp::SheetRename { from, to } => target_sheet(wb, from)?.rename(to),
     }
 }
@@ -490,21 +538,77 @@ fn apply_formats(rng: &Range, s: &FormatSnapshot) -> Result<()> {
             let _ = f.set_name(v);
         }
     }
-    // 填充按三态还原：无填充要清掉（否则撤销后填色还留在表上），混合则原样不动
-    match (s.interior, rng.interior()) {
-        (Some(None), Ok(interior)) => {
-            let _ = interior.clear();
-        }
-        (Some(Some(v)), Ok(interior)) => {
-            let _ = interior.set_color(v);
-        }
-        _ => {}
-    }
+    restore_fill(&rng, &s.fill);
     // 边框逐边还原（快照为空 = 当时读不到边框对象，跳过）
     if let Ok(borders) = rng.borders() {
         borders.restore(&s.borders);
     }
     Ok(())
+}
+
+/// 填充快照（见 [`FillSnap`]）：整块一致一次读搞定；混杂才逐格细读，且只在小区域上做。
+fn snap_fill(rng: &Range) -> FillSnap {
+    if let Some(state) = rng.interior().ok().and_then(|x| x.fill()) {
+        return FillSnap::Uniform(state);
+    }
+    let (rows, cols) = (rng.rows().unwrap_or(0), rng.columns().unwrap_or(0));
+    if rows <= 0 || cols <= 0 || rows as i64 * cols as i64 > FILL_CELL_LIMIT {
+        return FillSnap::Skip;
+    }
+    let mut states = Vec::with_capacity((rows * cols) as usize);
+    for r in 0..rows {
+        // 先按行读一次：表头/表体那种成块布局，绝大多数行一次就读出统一值，
+        // 省下逐格的往返（逐格读一格要 3~4 次 COM 调用，小区域也得上百 ms）
+        match row(rng, r, cols).and_then(|x| x.interior().ok()).and_then(|x| x.fill()) {
+            Some(state) => states.resize(states.len() + cols as usize, Some(state)),
+            None => {
+                for c in 0..cols {
+                    states.push(cell(rng, r, c).and_then(|x| x.interior().ok()).and_then(|x| x.fill()));
+                }
+            }
+        }
+    }
+    FillSnap::Cells { cols, states }
+}
+
+/// 还原填充：整块直接写整块，逐格的写回各自那一格（`None` 跳过 = 当时读不出来）。
+fn restore_fill(rng: &Range, snap: &FillSnap) {
+    match snap {
+        FillSnap::Uniform(state) => put_fill(rng, Some(*state)),
+        FillSnap::Cells { cols, states } => {
+            for (index, state) in states.iter().enumerate() {
+                let (r, c) = (index as i32 / cols, index as i32 % cols);
+                if let Some(cell) = cell(rng, r, c) {
+                    put_fill(&cell, *state);
+                }
+            }
+        }
+        FillSnap::Skip => {}
+    }
+}
+
+/// 写一格（或一块）的填充：无填充要清掉（否则撤销后新刷的底纹还留在表上），读不出的跳过。
+fn put_fill(rng: &Range, state: Option<Option<u32>>) {
+    let Ok(interior) = rng.interior() else { return };
+    match state {
+        Some(None) => {
+            let _ = interior.clear();
+        }
+        Some(Some(v)) => {
+            let _ = interior.set_color(v);
+        }
+        None => {}
+    }
+}
+
+/// 区域左上角偏移 `r` 行 `c` 列的那一格。
+fn cell(rng: &Range, r: i32, c: i32) -> Option<Range> {
+    rng.offset(r, c).ok()?.resize(1, 1).ok()
+}
+
+/// 区域的第 `r` 行（`cols` 列）。
+fn row(rng: &Range, r: i32, cols: i32) -> Option<Range> {
+    rng.offset(r, 0).ok()?.resize(1, cols).ok()
 }
 
 /// 按某条记录的**目标区域**取「当前状态」快照，做成一条可反向应用的条目
@@ -524,6 +628,7 @@ fn snapshot_like(wb: &Workbook, op: &UndoOp) -> Result<UndoOp> {
         ),
         UndoOp::SheetDelete { name } => UndoOp::SheetCreate { name: name.clone() },
         UndoOp::SheetCreate { name } => UndoOp::SheetDelete { name: name.clone() },
+        UndoOp::Conds(c) => UndoOp::Conds(snap_conds(&target_sheet(wb, &c.sheet)?, &c.addr)?),
         UndoOp::SheetRename { from, to } => UndoOp::SheetRename { from: to.clone(), to: from.clone() },
     })
 }
