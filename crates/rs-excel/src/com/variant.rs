@@ -16,8 +16,12 @@ pub enum ComValue {
     Bool(bool),
     Int(i32),
     Float(f64),
-    /// VT_EMPTY，用于省略可选参数
+    /// VT_EMPTY：**空值**（多数成员的可选参数收它就行，如 `Worksheets.Add` 的 Before）
     Empty,
+    /// 真的「省略这个可选参数」：VT_ERROR + DISP_E_PARAMNOTFOUND（VBA 里 `, ,` 那个空档）。
+    /// VT_EMPTY 是空**值**不是省略 —— 引擎会把它当参数值去解析，解析不了就直接抛异常
+    /// （实报：Excel 上 `Slicers.Add` 的 Level「非 OLAP 不支持此参数」，传 Empty 必抛 0x80020009）
+    Missing,
     /// COM 对象参数（如把 Range 传给 SetSourceData）
     Obj(IDispatch),
     /// 预构造的 VARIANT（如 SAFEARRAY 数组参数），原样传递
@@ -32,6 +36,7 @@ impl std::fmt::Debug for ComValue {
             Self::Int(i) => write!(f, "Int({i})"),
             Self::Float(v) => write!(f, "Float({v})"),
             Self::Empty => write!(f, "Empty"),
+            Self::Missing => write!(f, "Missing"),
             Self::Obj(_) => write!(f, "Obj(<IDispatch>)"),
             Self::Raw(v) => {
                 let vt = unsafe { v.Anonymous.Anonymous.vt }.0;
@@ -96,6 +101,15 @@ impl From<ComValue> for VARIANT {
             ComValue::Int(i) => VARIANT::from(i),
             ComValue::Float(f) => VARIANT::from(f),
             ComValue::Empty => VARIANT::default(),
+            ComValue::Missing => {
+                // DISP_E_PARAMNOTFOUND：可选参数「省略」的官方编码（VBA 的 `, ,` 就是它）
+                let mut var = VARIANT::default();
+                unsafe {
+                    (*var.Anonymous.Anonymous).vt = VT_ERROR;
+                    (*var.Anonymous.Anonymous).Anonymous.scode = 0x8002_0004u32 as i32;
+                }
+                var
+            }
             ComValue::Raw(v) => v,
             ComValue::Obj(d) => {
                 let mut var = VARIANT::default();

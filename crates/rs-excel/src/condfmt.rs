@@ -493,6 +493,24 @@ impl FormatCondition {
     }
 }
 
+/// Formula1/2 归一化：裸文本（如 `优秀`）包成字符串字面量 `"优秀"`。
+///
+/// 为什么必须包：单元格值规则比对文本时，公式必须是带引号的字面量 —— 这是 Excel 界面
+/// 生成条件格式时的形态。AI 经常直接发裸文本（`v1:"优秀"`），Excel 容错、WPS 直接抛
+/// 0x80020009「发生意外」（实报：cond E2:G11 失败）。数字与 `=` 开头的引用/公式原样放行，
+/// 撤销重建时从 COM 读回的公式（本就带引号）也不动
+fn cond_formula_value(raw: &str) -> String {
+    let v = raw.trim();
+    if v.is_empty() || v.starts_with('=') || v.parse::<f64>().is_ok() {
+        return v.to_string();
+    }
+    // 已是字面量（"…"）不重复包
+    if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
+        return v.to_string();
+    }
+    format!("\"{v}\"")
+}
+
 // ── Range 上的条件格式 API ──
 
 impl Range {
@@ -572,19 +590,20 @@ impl Range {
     }
 
     /// 单元格值规则：如 `cond_value(CondOp::Greater, "100", None, &fmt)` 标红大于 100。
-    /// 值可直接写 `"100"`，也可引用 `"=$B$1"`；`v2` 仅 Between/NotBetween 需要。
+    /// 值可直接写 `"100"`，也可引用 `"=$B$1"`；文本值直接写（`"优秀"` 会自动加引号）；
+    /// `v2` 仅 Between/NotBetween 需要。
     pub fn cond_value(&self, op: CondOp, v1: &str, v2: Option<&str>, fmt: &CondFormat) -> Result<()> {
         let mut named = vec![
             ("Operator", op.code().into()),
-            ("Formula1", v1.into()),
+            ("Formula1", cond_formula_value(v1).into()),
         ];
         if let Some(v2) = v2 {
-            named.push(("Formula2", v2.into()));
+            named.push(("Formula2", cond_formula_value(v2).into()));
         }
         self.cond_add(
             vec![(1i32).into()],
             &named,
-            "值可写 \"100\" 或引用 \"=$B$1\"；v2 仅 Between/NotBetween 需要",
+            "值可写 \"100\" 或引用 \"=$B$1\"、文本直接写；v2 仅 Between/NotBetween 需要",
             fmt,
         )
     }

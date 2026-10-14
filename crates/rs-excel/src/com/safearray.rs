@@ -18,6 +18,38 @@ use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_VARIANT};
 
 use crate::com::variant::{variant_to_cellvalue, variant_to_cellvalue_typed, CellValue, ComValue};
 
+/// 一维 `ComValue` 列表 → `VT_ARRAY|VT_VARIANT` 的 1 维 SAFEARRAY VARIANT（0 基）。
+/// 供 AutoFilter 多选 Criteria1、透视表 Group 的 Periods、Subtotal 的 TotalList、
+/// AddFields 字段名数组、VisibleSlicerItemsList 等数组参数复用。
+pub fn list_to_variant(items: Vec<ComValue>) -> Result<VARIANT> {
+    if items.is_empty() {
+        return Err(anyhow!("数组参数为空"));
+    }
+    let n = items.len() as u32;
+    let bounds = [SAFEARRAYBOUND {
+        cElements: n,
+        lLbound: 0,
+    }];
+    let psa = unsafe { SafeArrayCreate(VT_VARIANT, 1, bounds.as_ptr()) };
+    if psa.is_null() {
+        return Err(anyhow!("SafeArrayCreate 失败"));
+    }
+    for (i, item) in items.into_iter().enumerate() {
+        let v = VARIANT::from(item);
+        let idx = [i as i32];
+        unsafe {
+            SafeArrayPutElement(psa, idx.as_ptr(), &v as *const VARIANT as *mut _)?;
+        }
+        drop(v); // PutElement 内部已深拷贝，清掉本地副本
+    }
+    let mut var = VARIANT::default();
+    unsafe {
+        (*var.Anonymous.Anonymous).vt = VT_ARRAY | VT_VARIANT;
+        (*var.Anonymous.Anonymous).Anonymous.parray = psa;
+    }
+    Ok(var)
+}
+
 /// 读取 `Range.Value` 返回的 VARIANT：多格 → 2D 网格；单格 → 1x1 网格。
 pub fn variant_to_rows(v: &VARIANT) -> Result<Vec<Vec<CellValue>>> {
     variant_to_rows_with(v, variant_to_cellvalue)

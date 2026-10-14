@@ -22,6 +22,8 @@
 //! - 行列插入/删除经整表内容快照恢复值/公式，被移动区域的格式不还原；
 //! - 格式快照里，区域填充混杂时会逐格细读（小区域才做，见 [`FILL_CELL_LIMIT`]）；
 //!   边框混杂时按「跳过」处理（不猜一个值去还原）。
+//! - VBA/宏可能改任意表，用 [`History::record_workbook`] 整簿记（只记值+公式，
+//!   执行后由 [`History::seal_workbook`] 把新写进来的区域补成「执行前是空」）。
 
 use anyhow::{bail, Result};
 use std::cell::RefCell;
@@ -107,6 +109,9 @@ enum UndoOp {
     SheetCreate { name: String },
     /// 应用到表上 = 把 `from` 改名为 `to`。
     SheetRename { from: String, to: String },
+    /// 整簿内容快照（VBA/宏执行前记：代码可能改任意表）：撤销 = 逐表写回。
+    /// 只记值+公式 —— 格式/新增表/图形的整簿快照代价与不确定性都太高
+    Workbook { sheets: Vec<CellsSnapshot> },
 }
 
 /// 一条历史记录（含操作描述）。
@@ -125,6 +130,7 @@ impl std::fmt::Display for UndoEntry {
             UndoOp::Conds(c) => write!(f, " @ {}!{}", c.sheet, c.addr),
             UndoOp::SheetDelete { name } | UndoOp::SheetCreate { name } => write!(f, "（工作表 {name}）"),
             UndoOp::SheetRename { from, to } => write!(f, "（工作表 {from} → {to}）"),
+            UndoOp::Workbook { sheets } => write!(f, "（整簿 {} 张表）", sheets.len()),
         }
     }
 }
@@ -273,6 +279,40 @@ impl History {
                 to: old.into(),
             },
         );
+    }
+
+    /// 记录整簿内容快照（VBA/宏执行前用：代码可能改任意表任意格，只能整簿记）。
+    /// 空表记 A1 单格 —— VBA 常往空表写数据，不记就整表撤不回来
+    pub fn record_workbook(&self, wb: &Workbook, desc: impl Into<String>) -> Result<()> {
+        let mut sheets = Vec::new();
+        for info in wb.sheets()? {
+            let ws = wb.sheet(&info.name)?;
+            let addr = match ws.used_addr() {
+                Ok(addr) if !addr.is_empty() => addr,
+                _ => "A1".to_string(),
+            };
+            sheets.push(snap_cells(&ws, &addr)?);
+        }
+        self.push(desc.into(), UndoOp::Workbook { sheets });
+        Ok(())
+    }
+
+    /// 把栈顶的整簿快照按**当前**已用区域补齐（VBA 执行后调用）。
+    /// 执行后新写进来的格子，执行前的状态本就是空 —— 按新区域补上空格子，
+    /// 撤销时才能把它们一并清掉（否则「写到原数据区之外」的内容撤不掉）
+    pub fn seal_workbook(&self, wb: &Workbook) -> Result<()> {
+        let mut entries = self.entries.borrow_mut();
+        let Some(top) = entries.last_mut() else { return Ok(()) };
+        let UndoOp::Workbook { sheets } = &mut top.op else { return Ok(()) };
+        for snap in sheets.iter_mut() {
+            // 表被删了就无从补齐（其余表照常）；读不到已用区域也跳过
+            let Ok(ws) = wb.sheet(&snap.sheet) else { continue };
+            match ws.used_addr() {
+                Ok(addr) if !addr.is_empty() => widen(snap, &addr),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     // ── 撤销 / 恢复 ──
@@ -458,6 +498,15 @@ fn restore(wb: &Workbook, op: &UndoOp) -> Result<()> {
         UndoOp::SheetCreate { name } => wb.add_sheet(name, None).map(|_| ()),
         UndoOp::Conds(c) => target_range(wb, &c.sheet, &c.addr)?.apply_conds(&c.rules),
         UndoOp::SheetRename { from, to } => target_sheet(wb, from)?.rename(to),
+        UndoOp::Workbook { sheets } => {
+            for snap in sheets {
+                // 表可能被 VBA 删掉：无从写回就跳过（其余表照常还原）
+                let Ok(ws) = target_sheet(wb, &snap.sheet) else { continue };
+                let rng = ws.range(&snap.addr)?;
+                write_back(&ws, &rng, snap)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -630,7 +679,46 @@ fn snapshot_like(wb: &Workbook, op: &UndoOp) -> Result<UndoOp> {
         UndoOp::SheetCreate { name } => UndoOp::SheetDelete { name: name.clone() },
         UndoOp::Conds(c) => UndoOp::Conds(snap_conds(&target_sheet(wb, &c.sheet)?, &c.addr)?),
         UndoOp::SheetRename { from, to } => UndoOp::SheetRename { from: to.clone(), to: from.clone() },
+        // 表被删了就无从重拍（恢复时同样跳过它）；读不出的表直接略过
+        UndoOp::Workbook { sheets } => UndoOp::Workbook {
+            sheets: sheets
+                .iter()
+                .filter_map(|s| snap_cells(&target_sheet(wb, &s.sheet).ok()?, &s.addr).ok())
+                .collect(),
+        },
     })
+}
+
+/// 把内容快照的区域扩到 `grown`（只扩不缩）：旧网格嵌回左上角，新增部分记空
+/// （那些格子在快照时本就空着 —— 补上才能在撤销时清掉执行后写进去的内容）
+fn widen(snap: &mut CellsSnapshot, grown: &str) {
+    let old_br = snap.addr.rsplit(':').next().unwrap_or(&snap.addr);
+    let new_br = grown.rsplit(':').next().unwrap_or(grown);
+    if !bigger(new_br, old_br) {
+        return;
+    }
+    let Some((c0, r0)) = parse_addr(snap.addr.split(':').next().unwrap_or(&snap.addr)) else { return };
+    let Some((c1, r1)) = parse_addr(new_br) else { return };
+    let cols = (c1 - c0 + 1).max(1) as usize;
+    let rows = (r1 - r0 + 1).max(1) as usize;
+    let mut grid = vec![vec![CellValue::Empty; cols]; rows];
+    for (r, row) in snap.grid.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            if r < rows && c < cols {
+                grid[r][c] = cell.clone();
+            }
+        }
+    }
+    snap.addr = format!("{}:{new_br}", snap.addr.split(':').next().unwrap_or(&snap.addr));
+    snap.grid = grid;
+}
+
+/// 新区域的右下角是否超出旧区域的（行或列任一更大就算变大）
+fn bigger(new_br: &str, old_br: &str) -> bool {
+    match (parse_addr(new_br), parse_addr(old_br)) {
+        (Some((nc, nr)), Some((oc, or))) => nc > oc || nr > or,
+        _ => false,
+    }
 }
 
 fn target_sheet(wb: &Workbook, name: &str) -> Result<Worksheet> {

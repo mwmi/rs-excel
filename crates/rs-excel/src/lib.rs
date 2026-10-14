@@ -31,7 +31,11 @@
 //!   `range.format_conditions()` 或 `cond_value` / `cond_formula` / `cond_text` /
 //!   `cond_color_scale` / `cond_data_bar` / `cond_icon` 等一次性方法 → 条件格式规则增删查；
 //!   `worksheet.page_setup()` → 页边距/纸张/方向/打印区域/缩放/页眉页脚/打印标题；
-//!   `worksheet.shapes()` → 形状/图片/文本框的增删改查、外观、文本与批量操作。
+//!   `worksheet.shapes()` → 形状/图片/文本框的增删改查、外观、文本与批量操作；
+//!   `worksheet.add_pivot()` → 透视表创建/布局/日期数值分组/按值排序/Top-N/页与项筛选/切片器；
+//!   `range.sort_by_cols` 多键排序、`filter_and` / `filter_or` / `filter_values` /
+//!   `filter_top` / `filter_advanced` / `extract_unique` 筛选系列、`subtotal` 分类汇总、
+//!   `group_rows` / `group_cols` 大纲分组。
 //! - **VBA 双通道**：简单操作走内置 API；复杂操作走 `Vba::run_macro`（无需设置）
 //!   或 `Vba::execute`（注入临时模块，需开启信任访问）。
 //! - **操作撤销**：经 COM 做的修改不进应用撤销栈（`Application.Undo` 无效），
@@ -63,6 +67,7 @@ pub mod events;
 pub mod fonts;
 pub mod history;
 pub mod pagesetup;
+pub mod pivot;
 pub mod process;
 pub mod shape;
 
@@ -86,6 +91,7 @@ pub mod prelude {
     pub use crate::fonts::system_font_names;
     pub use crate::history::{History, UndoEntry};
     pub use crate::pagesetup::{Margin, Orientation, PageSetup, PaperSize, Section};
+    pub use crate::pivot::{AggFunc, DatePart, PivotFieldInfo, PivotItemInfo, PivotTable, Slicer, SlicerItemInfo};
     pub use crate::process::{bring_to_front, flash_window, kill, kill_all, processes, restore_if_minimized, ProcessInfo};
     pub use crate::range::{AlignH, AlignV, EndDir, Range, SpecialCells};
     pub use crate::shape::{
@@ -110,6 +116,7 @@ pub use events::{AppState, EventMonitor, ExcelEvent};
 pub use fonts::system_font_names;
 pub use history::{History, UndoEntry};
 pub use pagesetup::{Margin, Orientation, PageSetup, PaperSize, Section};
+pub use pivot::{AggFunc, DatePart, PivotFieldInfo, PivotItemInfo, PivotTable, Slicer, SlicerItemInfo};
 pub use process::{bring_to_front, flash_window, kill, kill_all, processes, restore_if_minimized, ProcessInfo};
 pub use range::{AlignH, AlignV, EndDir, Range, SpecialCells};
 pub use shape::{

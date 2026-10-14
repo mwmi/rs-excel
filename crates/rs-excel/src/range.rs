@@ -3,9 +3,10 @@
 use anyhow::{bail, Result};
 
 use crate::com::dispatch::{member_notfound, IDispatchWrapper};
-use crate::com::safearray::{rows_to_variant, variant_to_rows, variant_to_rows_typed};
+use crate::com::safearray::{list_to_variant, rows_to_variant, variant_to_rows, variant_to_rows_typed};
 use crate::com::variant::{CellValue, ComValue};
 use crate::error::ExcelError;
+use crate::pivot::AggFunc;
 use crate::style::{Borders, Font, Interior};
 use crate::worksheet::parse_tsv;
 
@@ -606,6 +607,180 @@ impl Range {
     /// 取消筛选（对已筛选区域再次无参调用 AutoFilter）。
     pub fn filter_off(&self) -> Result<()> {
         self.raw.call("AutoFilter", vec![]).map(|_| ())
+    }
+
+    /// 双条件 AND 筛选，如 `filter_and(1, ">100", "<1000")`（数值区间）。
+    pub fn filter_and(&self, field: i32, c1: &str, c2: &str) -> Result<()> {
+        self.filter2(field, 1, c1, c2) // xlAnd
+    }
+
+    /// 双条件 OR 筛选，如 `filter_or(2, "北京", "上海")`。
+    pub fn filter_or(&self, field: i32, c1: &str, c2: &str) -> Result<()> {
+        self.filter2(field, 2, c1, c2) // xlOr
+    }
+
+    fn filter2(&self, field: i32, op: i32, c1: &str, c2: &str) -> Result<()> {
+        self.raw
+            .call_named(
+                "AutoFilter",
+                vec![],
+                &[
+                    ("Field", field.into()),
+                    ("Criteria1", c1.into()),
+                    ("Operator", op.into()),
+                    ("Criteria2", c2.into()),
+                ],
+            )
+            .map_err(|e| ExcelError::hint(e, "field 为区域内 1 基列号；条件支持 \">100\"、\"<>x\" 与通配符 * ?"))
+            .map(|_| ())
+    }
+
+    /// 多选筛选（等价筛选项勾选），如 `filter_values(2, &["苹果", "香蕉"])`。
+    /// 值须与单元格文本完全一致。
+    pub fn filter_values(&self, field: i32, values: &[&str]) -> Result<()> {
+        if values.is_empty() {
+            bail!("filter_values：values 不能为空（清筛选用 filter_off）");
+        }
+        let arr = list_to_variant(values.iter().map(|s| (*s).into()).collect())?;
+        self.raw
+            .call_named(
+                "AutoFilter",
+                vec![],
+                &[
+                    ("Field", field.into()),
+                    ("Criteria1", ComValue::Raw(arr)),
+                    ("Operator", (7i32).into()), // xlFilterValues
+                ],
+            )
+            .map_err(|e| ExcelError::hint(e, "值须与单元格文本完全一致（区分大小写与空格）"))
+            .map(|_| ())
+    }
+
+    /// 前/后 N 项筛选，如 `filter_top(3, 10, false, true)` 取数值前 10；
+    /// `percent=true` 时按百分比（1~100）。
+    pub fn filter_top(&self, field: i32, n: i32, percent: bool, from_top: bool) -> Result<()> {
+        // xlTop10Items=3 / xlBottom10Items=4 / xlTop10Percent=5 / xlBottom10Percent=6
+        let op = match (percent, from_top) {
+            (false, true) => 3,
+            (false, false) => 4,
+            (true, true) => 5,
+            (true, false) => 6,
+        };
+        self.raw
+            .call_named(
+                "AutoFilter",
+                vec![],
+                &[("Field", field.into()), ("Criteria1", n.into()), ("Operator", op.into())],
+            )
+            .map_err(|e| ExcelError::hint(e, "field 为区域内 1 基列号，n 为 1~500 的项数或 1~100 的百分比"))
+            .map(|_| ())
+    }
+
+    /// 高级筛选：`criteria` 条件区域（None 免条件；同行 AND、跨行 OR），
+    /// `to` 目标区左上角（None 原位筛选，不满足条件的行被隐藏），`unique` 只取唯一行。
+    pub fn filter_advanced(&self, criteria: Option<&Range>, to: Option<&Range>, unique: bool) -> Result<()> {
+        let mut named: Vec<(&str, ComValue)> = vec![
+            // xlFilterInPlace = 1 / xlFilterCopy = 2
+            ("Action", (if to.is_some() { 2i32 } else { 1 }).into()),
+            ("Unique", unique.into()),
+        ];
+        if let Some(c) = criteria {
+            named.push(("CriteriaRange", ComValue::Obj(c.raw().disp.clone())));
+        }
+        if let Some(t) = to {
+            named.push(("CopyToRange", ComValue::Obj(t.raw().disp.clone())));
+        }
+        self.raw
+            .call_named("AdvancedFilter", vec![], &named)
+            .map_err(|e| {
+                ExcelError::hint(e, "条件区域首行须为与数据区一致的列标题（同行 AND、跨行 OR）；复制模式须给 to")
+            })
+            .map(|_| ())
+    }
+
+    /// 提取唯一行到目标区域（不动原数据）。
+    pub fn extract_unique(&self, to: &Range) -> Result<()> {
+        self.filter_advanced(None, Some(to), true)
+    }
+
+    /// 多键排序（SortFields 现代路径，键数不限）。
+    /// `keys` 为 (区域内 1 基列号, 是否升序)，如 `sort_by_cols(&[(2, false), (1, true)], true)`。
+    pub fn sort_by_cols(&self, keys: &[(i32, bool)], has_header: bool) -> Result<()> {
+        if keys.is_empty() {
+            bail!("sort_by_cols：keys 不能为空");
+        }
+        let ws = self.raw.get_obj("Parent", "Parent")?; // 工作表
+        let sort = ws.get_obj("Sort", "Sort")?;
+        let fields = sort.get_obj("SortFields", "SortFields")?;
+        let _ = fields.call("Clear", vec![]); // 无历史排序时报错，属正常前置清理
+        for (col, asc) in keys {
+            if *col < 1 {
+                bail!("sort_by_cols：列号须 ≥ 1（区域内相对列号）");
+            }
+            let key = self.raw.call("Cells", vec![(1i32).into(), (*col).into()])?.idispatch()?;
+            fields.call_named(
+                "Add",
+                vec![],
+                &[
+                    ("Key", ComValue::Obj(key.disp.clone())),
+                    ("SortOn", (0i32).into()),  // xlSortOnValues
+                    ("Order", (if *asc { 1i32 } else { 2 }).into()), // xlAscending / xlDescending
+                    ("DataOption", (0i32).into()), // xlSortNormal
+                ],
+            )?;
+        }
+        sort.call("SetRange", vec![ComValue::Obj(self.raw.disp.clone())])?;
+        sort.put("Header", vec![(if has_header { 1i32 } else { 2 }).into()])?; // xlYes / xlNo
+        sort.call("Apply", vec![])
+            .map_err(|e| ExcelError::hint(e, "列号须在本区域内；引擎不支持 SortFields 时改用 sort_by 单键"))
+            .map(|_| ())
+    }
+
+    /// 分类汇总。`group_col` 分组列（区域内 1 基列号），`total_cols` 参与汇总的列号，
+    /// 如 `subtotal(1, AggFunc::Sum, &[2, 3])`。区域须含表头。
+    pub fn subtotal(&self, group_col: i32, func: AggFunc, total_cols: &[i32]) -> Result<()> {
+        if total_cols.is_empty() {
+            bail!("subtotal：total_cols 不能为空");
+        }
+        let arr = list_to_variant(total_cols.iter().map(|c| (*c).into()).collect())?;
+        self.raw
+            .call_named(
+                "Subtotal",
+                vec![],
+                &[
+                    ("GroupBy", group_col.into()),
+                    ("Function", func.code().into()),
+                    ("TotalList", ComValue::Raw(arr)),
+                    ("Replace", true.into()),
+                ],
+            )
+            .map_err(|e| ExcelError::hint(e, "区域须含表头行；group_col/total_cols 为区域内 1 基列号"))
+            .map(|_| ())
+    }
+
+    /// 移除分类汇总。
+    pub fn remove_subtotal(&self) -> Result<()> {
+        self.raw.call("RemoveSubtotals", vec![]).map(|_| ())
+    }
+
+    /// 行分组（行号左侧可折叠）。
+    pub fn group_rows(&self) -> Result<()> {
+        self.raw.get_obj("Rows", "Rows")?.call("Group", vec![]).map(|_| ())
+    }
+
+    /// 取消行分组。
+    pub fn ungroup_rows(&self) -> Result<()> {
+        self.raw.get_obj("Rows", "Rows")?.call("Ungroup", vec![]).map(|_| ())
+    }
+
+    /// 列分组（列号上方可折叠）。
+    pub fn group_cols(&self) -> Result<()> {
+        self.raw.get_obj("Columns", "Columns")?.call("Group", vec![]).map(|_| ())
+    }
+
+    /// 取消列分组。
+    pub fn ungroup_cols(&self) -> Result<()> {
+        self.raw.get_obj("Columns", "Columns")?.call("Ungroup", vec![]).map(|_| ())
     }
 
     // ── 批注 / 超链接 / 数据验证 ──

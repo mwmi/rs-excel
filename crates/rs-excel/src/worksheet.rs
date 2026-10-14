@@ -7,6 +7,7 @@ use crate::com::dispatch::IDispatchWrapper;
 use crate::com::variant::{CellValue, ComValue};
 use crate::error::{ole_to_hex, ExcelError};
 use crate::pagesetup::PageSetup;
+use crate::pivot::{resolve_cell, PivotTable};
 use crate::range::Range;
 use crate::shape::Shapes;
 
@@ -272,6 +273,64 @@ impl Worksheet {
             })?;
         }
         Ok(crate::chart::Chart::from_raw(chart))
+    }
+
+    // ── 数据透视表 ──
+
+    /// 列出本表全部透视表名称。
+    pub fn pivot_tables(&self) -> Result<Vec<String>> {
+        let coll = self.raw.get_obj("PivotTables", "PivotTables")?;
+        let count = coll.get("Count")?.int()?;
+        let mut out = Vec::with_capacity(count.max(0) as usize);
+        for i in 1..=count {
+            out.push(coll.call("Item", vec![i.into()])?.idispatch()?.get("Name")?.string()?);
+        }
+        Ok(out)
+    }
+
+    /// 按名称绑定透视表。
+    pub fn pivot(&self, name: &str) -> Result<PivotTable> {
+        Ok(PivotTable::from_raw(
+            self.raw
+                .call("PivotTables", vec![name.into()])?
+                .idispatch_child(name)
+                .map_err(|e| ExcelError::hint(e, "透视表名不存在：用 pivot_tables() 列出"))?,
+        ))
+    }
+
+    /// 创建数据透视表。`source_addr` 源数据区域（首行须为表头），`dest` 左上角锚点
+    /// （如 "H3"，跨表 "Sheet2!H3"），`name` 为 None 时自动命名。
+    pub fn add_pivot(&self, source_addr: &str, dest: &str, name: Option<&str>) -> Result<PivotTable> {
+        let src = self.range(source_addr)?;
+        let wb = self.raw.get_obj("Parent", "Parent")?; // 工作簿
+        let dest_rng = resolve_cell(&self.raw, &wb, dest)?;
+        let caches = wb.get_obj("PivotCaches", "PivotCaches")?;
+        let src_obj = ComValue::Obj(src.raw().disp.clone());
+        // 优先 PivotCaches.Create（现代）；WPS 不支持回退 Add（SourceType xlDatabase = 1）
+        let cache = match caches.call_named(
+            "Create",
+            vec![],
+            &[("SourceType", (1i32).into()), ("SourceData", src_obj.clone())],
+        ) {
+            Ok(v) => v.idispatch()?,
+            Err(_) => caches
+                .call_named("Add", vec![], &[("SourceType", (1i32).into()), ("SourceData", src_obj)])?
+                .idispatch()?,
+        };
+        let mut named: Vec<(&str, ComValue)> =
+            vec![("TableDestination", ComValue::Obj(dest_rng.disp.clone()))];
+        if let Some(n) = name {
+            named.push(("TableName", n.into()));
+        }
+        let pt = cache
+            .call_named("CreatePivotTable", vec![], &named)
+            .map_err(|e| {
+                ExcelError::hint(
+                    e,
+                    "目标位置不得与源数据重叠且需为空白区域；源区域首行须为表头；跨表锚点格式 Sheet2!H3",
+                )
+            })?;
+        Ok(PivotTable::from_raw(pt.idispatch_child(name.unwrap_or("数据透视表"))?))
     }
 }
 
