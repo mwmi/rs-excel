@@ -574,22 +574,35 @@ impl Range {
             .map(|_| ())
     }
 
-    /// 排序。`key` 为排序关键列（须与本区域同一工作表，如表头下的 B2 或整列 B:B）。
-    pub fn sort_by(&self, key: &Range, ascending: bool, has_header: bool) -> Result<()> {
-        // xlAscending = 1 / xlDescending = 2；xlYes = 1 / xlNo = 2
-        let order: i32 = if ascending { 1 } else { 2 };
-        let header: i32 = if has_header { 1 } else { 2 };
+    /// 多键排序（区域内 1 基列号，最多 3 个键）。`keys` 如 `sort_by_cols(&[(3, true), (9, false)], true)`。
+    ///
+    /// 走**宏录制器那条** `Range.Sort(Key1, Order1, Key2, Order2, Key3, Order3, Header)`：
+    /// Key 取该列的**首行数据单元格**——有表头就是第 2 行。官方示例即此写法
+    /// （`Columns("A:C").Sort key1:=Range("C2"), order1:=xlAscending, header:=xlYes`）。
+    ///
+    /// **不要用 SortFields + Apply 那条现代路径**：WPS 上 `Apply` 必抛 0x80020009「发生意外」
+    /// （实测：同一区域两条路径全挂，报错完全一样），而它还得额外对齐 MatchCase / Orientation /
+    /// SortMethod，失败面更大。录制器能跑通的那条才是 WPS 真正实现的（同 SlicerCaches.Add2 那条经验）。
+    pub fn sort_by_cols(&self, keys: &[(i32, bool)], has_header: bool) -> Result<()> {
+        if keys.is_empty() {
+            bail!("sort_by_cols：keys 不能为空");
+        }
+        if keys.len() > 3 {
+            bail!("sort_by_cols：最多 3 个键（Range.Sort 只有 Key1~Key3）");
+        }
+        // Key 必须落在数据区（不含表头行），否则 WPS 直接抛 0x80020009
+        let row = if has_header { 2 } else { 1 };
+        let mut named: Vec<(&str, ComValue)> = Vec::with_capacity(7);
+        for (index, (col, asc)) in keys.iter().enumerate() {
+            let (key_name, order_name) = [("Key1", "Order1"), ("Key2", "Order2"), ("Key3", "Order3")][index];
+            let key = self.raw.call("Cells", vec![row.into(), (*col).into()])?.idispatch()?;
+            named.push((key_name, ComValue::Obj(key.disp)));
+            named.push((order_name, (if *asc { 1i32 } else { 2i32 }).into())); // xlAscending / xlDescending
+        }
+        named.push(("Header", (if has_header { 1i32 } else { 2i32 }).into())); // xlYes / xlNo
         self.raw
-            .call_named(
-                "Sort",
-                vec![],
-                &[
-                    ("Key1", ComValue::Obj(key.raw().disp.clone())),
-                    ("Order1", order.into()),
-                    ("Header", header.into()),
-                ],
-            )
-            .map_err(|e| ExcelError::hint(e, "key 须与本区域同一工作表，如 range(\"B2\")"))
+            .call_named("Sort", vec![], &named)
+            .map_err(|e| ExcelError::hint(e, "Key 须是本区域内该列的数据单元格（不含表头行），且排序范围不得含透视表"))
             .map(|_| ())
     }
 
@@ -701,39 +714,6 @@ impl Range {
     /// 提取唯一行到目标区域（不动原数据）。
     pub fn extract_unique(&self, to: &Range) -> Result<()> {
         self.filter_advanced(None, Some(to), true)
-    }
-
-    /// 多键排序（SortFields 现代路径，键数不限）。
-    /// `keys` 为 (区域内 1 基列号, 是否升序)，如 `sort_by_cols(&[(2, false), (1, true)], true)`。
-    pub fn sort_by_cols(&self, keys: &[(i32, bool)], has_header: bool) -> Result<()> {
-        if keys.is_empty() {
-            bail!("sort_by_cols：keys 不能为空");
-        }
-        let ws = self.raw.get_obj("Parent", "Parent")?; // 工作表
-        let sort = ws.get_obj("Sort", "Sort")?;
-        let fields = sort.get_obj("SortFields", "SortFields")?;
-        let _ = fields.call("Clear", vec![]); // 无历史排序时报错，属正常前置清理
-        for (col, asc) in keys {
-            if *col < 1 {
-                bail!("sort_by_cols：列号须 ≥ 1（区域内相对列号）");
-            }
-            let key = self.raw.call("Cells", vec![(1i32).into(), (*col).into()])?.idispatch()?;
-            fields.call_named(
-                "Add",
-                vec![],
-                &[
-                    ("Key", ComValue::Obj(key.disp.clone())),
-                    ("SortOn", (0i32).into()),  // xlSortOnValues
-                    ("Order", (if *asc { 1i32 } else { 2 }).into()), // xlAscending / xlDescending
-                    ("DataOption", (0i32).into()), // xlSortNormal
-                ],
-            )?;
-        }
-        sort.call("SetRange", vec![ComValue::Obj(self.raw.disp.clone())])?;
-        sort.put("Header", vec![(if has_header { 1i32 } else { 2 }).into()])?; // xlYes / xlNo
-        sort.call("Apply", vec![])
-            .map_err(|e| ExcelError::hint(e, "列号须在本区域内；引擎不支持 SortFields 时改用 sort_by 单键"))
-            .map(|_| ())
     }
 
     /// 分类汇总。`group_col` 分组列（区域内 1 基列号），`total_cols` 参与汇总的列号，

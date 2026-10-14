@@ -3,7 +3,9 @@
 use anyhow::Result;
 
 use crate::com::dispatch::IDispatchWrapper;
+use crate::com::variant::ComValue;
 use crate::error::ExcelError;
+use crate::range::Range;
 
 /// 图表类型（XlChartType 常量）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,5 +74,25 @@ impl Chart {
     /// 删除图表。
     pub fn delete(&self) -> Result<()> {
         self.raw.get_obj("Parent", "Parent")?.call("Delete", vec![]).map(|_| ())
+    }
+
+    /// 把每个序列的**分类轴（X 轴标签）**指向 `cat`，`cat` 只给数据行那些格（如 `B2:B11`）。
+    ///
+    /// 为什么需要它：`SetSourceData` 只收**一整块矩形**，而「姓名 + 总分」这种分类列与数值列
+    /// **不相邻**的图它表达不了 —— 两块拼成一个 union 传进去会被当成**两个序列**（姓名那列
+    /// 自己也变成一条折线），列再多就是一串序列。只能建完图后逐条设 `XValues`。
+    pub fn set_categories(&self, cat: &Range) -> Result<()> {
+        // 先把取向定死成「每列一条序列」：单列数据默认按「每行一条」解，一列 10 个数会变成
+        // 10 条各含 1 个点的序列（实测：SERIES 里 values 是 $I$2、$I$3… 一格一条，图是一片平线）
+        self.raw.put("PlotBy", vec![(2i32).into()])?; // xlColumns
+        let series = self.raw.get_obj("SeriesCollection", "SeriesCollection")?;
+        let count = series.get("Count")?.int()?;
+        for index in 1..=count {
+            series
+                .call("Item", vec![index.into()])?
+                .idispatch()?
+                .put("XValues", vec![ComValue::Obj(cat.raw().disp.clone())])?;
+        }
+        Ok(())
     }
 }
