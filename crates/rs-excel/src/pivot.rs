@@ -1,5 +1,5 @@
 //! 数据透视表与切片器：创建（`worksheet.add_pivot`）、布局、值字段、日期/数值分组、
-//! 按值排序、Top-N、页筛选与项筛选、读取结果、切片器批量点选。
+//! 按值排序、Top-N、页筛选与项筛选、字段移除、读取结果、切片器批量点选。
 //!
 //! ```no_run
 //! # let sheet = unreachable!();
@@ -293,16 +293,28 @@ impl PivotTable {
     ///
     /// **只走 `Orientation = xlDataField` 一条路**：两个引擎都认，值字段按引擎默认口径建出来
     /// （数值列 = 求和、文本列 = 计数）。不用 `AddDataField`、也不依赖 `PivotField.Function` ——
-    /// WPS 上这两个都必抛 0x80020009（实报）；好在这条路**天然幂等**（同一字段不会两次进值区域，
-    /// 重复调用不会多出一列）。
+    /// WPS 上这两个都必抛 0x80020009（实报）。
+    ///
+    /// **防重不靠引擎**：WPS 上对已在值区域的字段再设一次 Orientation 会多出一列
+    /// 「求和项:xxx2」（实报：add 带 data 后又 data/set 同一字段，两个模型都建出重复列；
+    /// Excel 上同样是空操作）—— 所以设之前先翻 `fields()`，`SourceName` 对得上就直接
+    /// 当已加过，不再碰 Orientation。删重复列用 `remove_field`。
     ///
     /// `Ok(s)` 里的 `s` 是**口径说明**（空串 = 就是 `func` 要的口径）：引擎不让改口径时值字段
     /// 仍然建好了，只是口径是引擎默认的 —— 这时**不能报错**（报错会让调用方重发整条建表指令、
     /// 撞上「at 被占/重名」更难懂），把这句话原样带回给模型，让它改用公式或在回答里说明。
     pub fn add_data(&self, field: &str, func: AggFunc) -> Result<String> {
-        let pf = self.field(field)?;
-        pf.put("Orientation", vec![(4i32).into()]) // xlDataField
-            .map_err(|e| ExcelError::hint(e, "进不了值区域：值字段必须是数据源里的列"))?;
+        // 防重（见方法文档）：字段已在值区域就不再设 Orientation，按 SourceName 认字段 ——
+        // 进了值区域后条目名常变成「求和项:源名」，拿源名照样认得出
+        let in_values = self
+            .fields()
+            .map(|all| all.iter().any(|f| f.orientation == "data" && f.source_name == field))
+            .unwrap_or(false);
+        if !in_values {
+            let pf = self.field(field)?;
+            pf.put("Orientation", vec![(4i32).into()]) // xlDataField
+                .map_err(|e| ExcelError::hint(e, "进不了值区域：值字段必须是数据源里的列"))?;
+        }
         // 挪动后旧对象可能作废：按源名重取，取不到再试引擎给的默认显示名（求和项/计数项）
         let data_field = self
             .field(field)
@@ -310,16 +322,20 @@ impl PivotTable {
             .or_else(|_| self.field(&format!("计数项:{field}")))?;
         // 求和是数值列的默认口径，不必碰 Function（WPS 那条 put 必抛）；
         // 要别的口径：改一次，改不动就刷新一次再改（值字段刚建出来可能还没生效）
+        let mut applied = true;
         if func != AggFunc::Sum {
-            if data_field.put("Function", vec![func.code().into()]).is_err() {
+            applied = data_field.put("Function", vec![func.code().into()]).is_ok();
+            if !applied {
                 let _ = self.refresh();
-                let _ = data_field.put("Function", vec![func.code().into()]);
+                applied = data_field.put("Function", vec![func.code().into()]).is_ok();
             }
         }
-        // 核对实际口径：读得出来就以它为准；读不出来（getter 也抛、或给出认不出的码）时按引擎
-        // 默认口径理解 —— 求和本来就是数值列的默认，不该为读不到就吭声
+        // 核对实际口径：读得出来就以它为准；**读不出来时信 put 的结果** —— getter 与 put 同源，
+        // 在部分引擎上同样必抛（0x80020009），读不到 ≠ 没改成。以前这里只要读不到就当「没改成」，
+        // 平均值整条改成功也会带回「引擎不让改口径」的说明，模型转手就告诉用户「不支持平均聚合」
+        //（2026-10-16 实报）
         let known = data_field.get("Function").ok().and_then(|value| value.int().ok()).and_then(AggFunc::from_code);
-        if known == Some(func) || (known.is_none() && func == AggFunc::Sum) {
+        if known == Some(func) || (known.is_none() && applied) {
             return Ok(String::new());
         }
         let got = known.map_or("默认口径（数值列求和、文本列计数）".to_string(), |f| format!("「{}」", f.prefix()));
@@ -329,6 +345,17 @@ impl PivotTable {
              （文本列先转成数值），或在回答里说明实际口径",
             func.prefix()
         ))
+    }
+
+    /// 把字段挪出行/列/页/值区域（`Orientation = xlHidden`）—— 删「求和项:xxx2」这种
+    /// 重复值字段、或撤掉某个行/列/页字段。字段名给源名或值区域里的显示名（「求和项:源名」）
+    /// 都行；字段本就没放在任何区域时静默成功。
+    pub fn remove_field(&self, field: &str) -> Result<()> {
+        self.field(field)
+            .or_else(|_| self.field(&format!("求和项:{field}")))
+            .or_else(|_| self.field(&format!("计数项:{field}")))?
+            .put("Orientation", vec![(0i32).into()]) // xlHidden
+            .map_err(|e| ExcelError::hint(e, format!("字段 \"{field}\" 挪不出区域：值字段名也可能是「求和项:{field}」，用 fields() 核对")))
     }
 
     /// 值区域（数据主体），读取透视结果用。无值字段时报错。

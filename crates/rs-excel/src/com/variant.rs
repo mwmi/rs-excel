@@ -5,8 +5,8 @@ use std::mem::ManuallyDrop;
 use windows::core::BSTR;
 use windows::Win32::System::Com::IDispatch;
 use windows::Win32::System::Variant::{
-    VARIANT, VT_BOOL, VT_BSTR, VT_DATE, VT_DISPATCH, VT_EMPTY, VT_ERROR, VT_I2, VT_I4, VT_I8,
-    VT_NULL, VT_R4, VT_R8,
+    VARIANT, VT_BOOL, VT_BSTR, VT_CY, VT_DATE, VT_DISPATCH, VT_EMPTY, VT_ERROR, VT_I2, VT_I4,
+    VT_I8, VT_NULL, VT_R4, VT_R8,
 };
 
 /// 传给 COM 的参数值。实现了常用类型的 `From`，调用处直接 `"A1".into()` / `123.into()`。
@@ -120,6 +120,21 @@ impl From<ComValue> for VARIANT {
                 var
             }
         }
+    }
+}
+
+/// xlErr* 错误码 → Excel 里那串错误文本（`Display` 会补上 `#`）。
+/// 不映射的话是裸 HRESULT（`0x800A07D7` 这种），模型会当成「不支持的类型」反复琢磨（实报过）
+fn error_text(scode: u32) -> String {
+    match scode & 0xFFFF {
+        2000 => "NULL!".into(),
+        2007 => "DIV/0!".into(),
+        2015 => "VALUE!".into(),
+        2023 => "REF!".into(),
+        2029 => "NAME?".into(),
+        2036 => "NUM!".into(),
+        2042 => "N/A".into(),
+        _ => format!("0x{scode:08X}"),
     }
 }
 
@@ -246,13 +261,17 @@ pub(crate) fn variant_to_cellvalue(v: &VARIANT) -> CellValue {
             CellValue::Number(u.fltVal as f64)
         } else if vt == VT_R8.0 {
             CellValue::Number(u.dblVal)
+        } else if vt == VT_CY.0 {
+            // 货币：`CY` 是 i64 缩放一万（Excel/WPS 里「货币」格式的格走 `Value` 通道就是这个）。
+            // 不认它会吐「<未支持的 VARIANT 类型 0x0006>」给模型 —— 模型把它当错误值反复琢磨（实报过）
+            CellValue::Number(u.cyVal.int64 as f64 / 10_000.0)
         } else if vt == VT_DATE.0 {
             // 日期以 Excel 序列值（f64）返回，README 有说明
             CellValue::Number(u.dblVal)
         } else if vt == VT_BOOL.0 {
             CellValue::Bool(bool::from(u.boolVal))
         } else if vt == VT_ERROR.0 {
-            CellValue::Error(format!("0x{:08X}", u.scode as u32))
+            CellValue::Error(error_text(u.scode as u32))
         } else {
             CellValue::Text(format!("<未支持的 VARIANT 类型 0x{vt:04X}>"))
         }

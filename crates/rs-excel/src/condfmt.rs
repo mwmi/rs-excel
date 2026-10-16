@@ -21,7 +21,7 @@
 //! 注意：公式类条件基于区域**左上角**相对引用；未覆盖的冷门场景走
 //! `range.raw().get("FormatConditions")` 直调 COM。
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use crate::com::dispatch::IDispatchWrapper;
 use crate::com::variant::ComValue;
@@ -542,12 +542,14 @@ impl Range {
                 bold: s.bold,
             };
             let _ = match s.type_code {
-                1 => self.cond_value(
-                    CondOp::from_code(s.operator),
-                    s.formula1.as_deref().unwrap_or_default(),
-                    s.formula2.as_deref(),
-                    &fmt,
-                ),
+                1 => {
+                    let op = CondOp::from_code(s.operator);
+                    // 快照里非区间规则也可能残留 Formula2（运算符被改过的旧规则）：
+                    // cond_value 只认区间规则的 v2，先滤掉，别让整条重建被挡掉
+                    let v2 =
+                        matches!(op, CondOp::Between | CondOp::NotBetween).then_some(s.formula2.as_deref()).flatten();
+                    self.cond_value(op, s.formula1.as_deref().unwrap_or_default(), v2, &fmt)
+                }
                 2 => self.cond_formula(s.formula1.as_deref().unwrap_or_default(), &fmt),
                 9 => self.cond_text(CondText::from_code(s.text_op), s.string.as_deref().unwrap_or_default(), &fmt),
                 // xlDuplicate = 7 / xlUnique = 8
@@ -592,25 +594,37 @@ impl Range {
     /// 单元格值规则：如 `cond_value(CondOp::Greater, "100", None, &fmt)` 标红大于 100。
     /// 值可直接写 `"100"`，也可引用 `"=$B$1"`；文本值直接写（`"优秀"` 会自动加引号）；
     /// `v2` 仅 Between/NotBetween 需要。
+    ///
+    /// 参数在碰 COM 之前校验：空 Formula1 / Between 缺 v2 在 WPS 上都是**同一个**
+    /// `0x80020009 发生意外`（探针实测），那句话看不出错在哪，模型只会反复重发
     pub fn cond_value(&self, op: CondOp, v1: &str, v2: Option<&str>, fmt: &CondFormat) -> Result<()> {
-        let mut named = vec![
-            ("Operator", op.code().into()),
-            ("Formula1", cond_formula_value(v1).into()),
-        ];
-        if let Some(v2) = v2 {
-            named.push(("Formula2", cond_formula_value(v2).into()));
+        let f1 = cond_formula_value(v1);
+        if f1.is_empty() {
+            bail!("cond_value：v1 不能为空（值可写 \"100\" 或引用 \"=$B$1\"、文本直接写）");
         }
-        self.cond_add(
-            vec![(1i32).into()],
-            &named,
-            "值可写 \"100\" 或引用 \"=$B$1\"、文本直接写；v2 仅 Between/NotBetween 需要",
-            fmt,
-        )
+        let mut named = vec![("Operator", op.code().into()), ("Formula1", f1.into())];
+        match op {
+            CondOp::Between | CondOp::NotBetween => {
+                let f2 = v2.map(cond_formula_value).unwrap_or_default();
+                if f2.is_empty() {
+                    bail!("cond_value：between/notbetween 必须同时给 v2（区间上限，如 \"120\"）");
+                }
+                named.push(("Formula2", f2.into()));
+            }
+            // 非区间运算符给 v2：WPS 会默默收下（规则却只按 v1 判）—— 明确报错，
+            // 别让一个「以为生效了」的错写法看起来像成功
+            _ if v2.is_some() => bail!("cond_value：v2 仅 between/notbetween 需要（请去掉 v2）"),
+            _ => {}
+        }
+        self.cond_add(vec![(1i32).into()], &named, "值可写 \"100\" 或引用 \"=$B$1\"、文本直接写；v2 仅 Between/NotBetween 需要", fmt)
     }
 
     /// 公式规则，`formula` 不以 = 开头会自动补。
     /// 公式基于区域**左上角**相对引用，如 `cond_formula("MOD(ROW(),2)=0", &fmt)` 偶数行填充。
     pub fn cond_formula(&self, formula: &str, fmt: &CondFormat) -> Result<()> {
+        if formula.trim().is_empty() {
+            bail!("cond_formula：公式不能为空（如 \"MOD(ROW(),2)=0\"，不必带 =）");
+        }
         let f = if formula.starts_with('=') {
             formula.to_string()
         } else {
@@ -626,6 +640,9 @@ impl Range {
 
     /// 文本规则：包含/不包含/开头/结尾匹配。
     pub fn cond_text(&self, kind: CondText, text: &str, fmt: &CondFormat) -> Result<()> {
+        if text.trim().is_empty() {
+            bail!("cond_text：匹配文字不能为空（要包含的文字直接写，如 \"优秀\"）");
+        }
         self.cond_add(
             vec![(9i32).into()],
             &[
@@ -651,6 +668,9 @@ impl Range {
 
     /// 前/后 N 项规则：`percent=true` 时 n 按百分比；`bottom=true` 取最小 N 项。
     pub fn cond_top(&self, n: i32, percent: bool, bottom: bool, fmt: &CondFormat) -> Result<()> {
+        if n <= 0 {
+            bail!("cond_top：n 必须 ≥ 1（percent=true 时是 1~100 的百分比）");
+        }
         let cond = self
             .raw()
             .get_obj("FormatConditions", "条件格式")?
