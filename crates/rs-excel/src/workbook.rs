@@ -154,16 +154,36 @@ impl Workbook {
                     .idispatch_child(name)?
             }
             None => {
-                let count = sheets.get("Count")?.int()?;
-                let last = sheets
-                    .call("Item", vec![count.into()])?
-                    .idispatch()?
-                    .disp
-                    .clone();
-                // Add(Before=省略, After=最后一张)
-                sheets
-                    .call("Add", vec![ComValue::Empty, ComValue::Obj(last)])?
-                    .idispatch_child(name)?
+                // **不要用 `Add(Empty, After)` 这种省略参数占位**：WPS 的 COM 对 VT_EMPTY
+                // 占位参数处理与 Excel 不一致，会直接报 0x800A03EC（应用层错误）。
+                // 实报 2026-10-18：用户说「创建数据透视表」，sheet_add 连试两个名字都失败，
+                // 模型只好改用「在原表右侧建透视」。零参数 Add 是唯一双方都稳的形态，
+                // 代价是新表落在活动表之前（不影响功能，需要末尾位置由调用方 Move）
+                match sheets.call("Add", vec![]) {
+                    Ok(added) => added.idispatch_child(name)?,
+                    Err(err) => {
+                        // 另一种常见原因：工作簿结构受保护（ProtectStructure），
+                        // 此时单元格能改、却加不了表 —— 现象与上面一模一样，必须分开告知
+                        let protected = self
+                            .raw
+                            .get("ProtectStructure")
+                            .map(|result| match result.value() {
+                                CellValue::Bool(flag) => flag,
+                                CellValue::Number(number) => number != 0.0,
+                                _ => false,
+                            })
+                            .unwrap_or(false);
+                        return Err(if protected {
+                            ExcelError::hint(
+                                err,
+                                "工作簿结构受保护（ProtectStructure），加不了工作表：先取消保护，或直接建在已有表上",
+                            )
+                        } else {
+                            ExcelError::hint(err, "新增工作表失败：确认工作簿未处于保护/共享状态")
+                        }
+                        .into());
+                    }
+                }
             }
         };
         let ws = Worksheet::from_raw(raw);
