@@ -13,7 +13,7 @@
 //! mon.stop();
 //! ```
 //!
-//! 注意：`app.enable_events(false)`（或 `set_fast(true)`）期间应用暂停派发事件，
+//! 注意：`app.enable_events(false)`（批量场景用 `app.fast_guard()`）期间应用暂停派发事件，
 //! 属于 Excel 语义，订阅本身不受影响。
 
 use std::fmt;

@@ -2,6 +2,8 @@
 
 use anyhow::{bail, Result};
 
+use crate::ai::error::ToolError;
+use crate::ai::write::{WritePath, WriteReport};
 use crate::com::dispatch::{member_notfound, IDispatchWrapper};
 use crate::com::safearray::{list_to_variant, rows_to_variant, variant_to_rows, variant_to_rows_typed};
 use crate::com::variant::{CellValue, ComValue};
@@ -49,7 +51,8 @@ pub enum SpecialCells {
     LastCell = 11,
 }
 
-/// 区域（Range COM 对象）：读写均为区域级批量。
+/// 区域（Range COM 对象）：读写均为区域级批量。`Clone` 只是 AddRef 同一个 COM 对象。
+#[derive(Clone)]
 pub struct Range {
     raw: IDispatchWrapper,
 }
@@ -161,12 +164,49 @@ impl Range {
     }
 
     /// 批量写网格（走 `Value2`）。形状必须与区域一致；SAFEARRAY 批量失败自动回退逐格。
-    pub fn set_values(&self, grid: &[Vec<CellValue>]) -> Result<()> {
-        if grid.is_empty() || grid[0].is_empty() {
-            bail!("set_values：数据为空");
+    ///
+    /// 写入前先做纯校验（空网格 / 行宽不一致 / 超过单次上限），**不合法时一次 COM 都不调**。
+    /// 返回的报告说明实际走的路径（`safearray` / 逐格）与格数。
+    pub fn set_values(&self, grid: &[Vec<CellValue>]) -> Result<WriteReport> {
+        let rows = grid.len();
+        if rows == 0 || grid[0].is_empty() {
+            return Err(ToolError::validation(
+                "EMPTY_GRID",
+                "写入数据为空",
+                "data 至少给一行一列",
+            )
+            .into());
+        }
+        let cols = grid[0].len();
+        if let Some((index, row)) = grid.iter().enumerate().find(|(_, row)| row.len() != cols) {
+            return Err(ToolError::validation(
+                "RAGGED_GRID",
+                format!(
+                    "第 {} 行有 {} 列，第 1 行有 {cols} 列",
+                    index + 1,
+                    row.len()
+                ),
+                "所有行的列数必须一致；缺的格写 null",
+            )
+            .into());
+        }
+        let cells = rows * cols;
+        if cells > crate::ai::cell::MAX_WRITE_CELLS {
+            return Err(ToolError::validation(
+                "LIMIT_EXCEEDED",
+                format!(
+                    "一次写入 {cells} 格，超过上限 {}",
+                    crate::ai::cell::MAX_WRITE_CELLS
+                ),
+                "拆成多次写入，或只写需要的区域",
+            )
+            .into());
         }
         match rows_to_variant(grid) {
-            Ok(v) => self.raw.put_raw("Value2", v),
+            Ok(v) => {
+                self.raw.put_raw("Value2", v)?;
+                Ok(WriteReport::new(rows as i32, cols as i32, WritePath::SafeArray))
+            }
             Err(_) => {
                 // 回退：逐格写（相对区域左上角）
                 for (r, row) in grid.iter().enumerate() {
@@ -177,7 +217,7 @@ impl Range {
                             .put("Value2", vec![ComValue::from(val.clone())])?;
                     }
                 }
-                Ok(())
+                Ok(WriteReport::new(rows as i32, cols as i32, WritePath::Cell))
             }
         }
     }
@@ -188,7 +228,7 @@ impl Range {
         if grid.is_empty() {
             bail!("write_tsv：没有可写入的数据");
         }
-        self.set_values(&grid)
+        self.set_values(&grid).map(|_| ())
     }
 
     /// 写公式，如 `set_formula("=SUM(A1:A9)")`。优先 `Formula2`（动态数组），

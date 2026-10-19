@@ -3,11 +3,13 @@
 //!
 //! ```no_run
 //! # let sheet = unreachable!();
-//! use rs_excel::{AggFunc, DatePart};
+//! use rs_excel::{AddDataOutcome, AggFunc, DatePart};
 //! // 源数据 A1:F100 → 透视表放 H3（可跨表 "Sheet2!H3"）
 //! let pt = sheet.add_pivot("A1:F100", "H3", None)?;
 //! pt.set_fields(&["地区"], &["产品"], &["日期"])?; // 行/列/页字段
-//! pt.add_data("销售额", AggFunc::Sum)?;            // 值字段
+//! if let AddDataOutcome::Unchanged { reason, .. } = pt.add_data("销售额", AggFunc::Sum)? {
+//!     eprintln!("值字段口径没改成功：{reason}");
+//! }
 //! pt.group_dates("日期", &[DatePart::Years, DatePart::Months])?; // 日期按年+月分组
 //! pt.sort_by_value("地区", "销售额", false)?;      // 行字段按值升序
 //! pt.show_top("地区", "销售额", 5, true)?;         // 只看前 5
@@ -63,7 +65,7 @@ impl AggFunc {
     }
 
     /// 值字段的默认名前缀（与 Excel/WPS 自动命名一致，如「求和项:销售额」）
-    fn prefix(self) -> &'static str {
+    pub fn prefix(self) -> &'static str {
         match self {
             Self::Sum => "求和项",
             Self::Average => "平均值项",
@@ -78,7 +80,7 @@ impl AggFunc {
     }
 
     /// 聚合名的英文键（回执里给 AI 的写法，与 op 层「字段:average」一致）
-    fn key(self) -> &'static str {
+    pub fn key(self) -> &'static str {
         match self {
             Self::Sum => "sum",
             Self::Average => "average",
@@ -108,6 +110,23 @@ impl AggFunc {
         .into_iter()
         .find(|func| func.code() == code)
     }
+}
+
+/// 值字段聚合设置的结果。
+///
+/// 旧接口用「`Ok` 里的非空字符串」表示口径没改成功 —— 调用方必须读字符串才知道失败。
+/// 现在失败/未生效是独立变体，机器可以直接判断。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddDataOutcome {
+    /// 已按要求的聚合生效（或本来就是该聚合）。
+    Applied,
+    /// 字段已存在/已建出，但聚合口径没能改成目标值。
+    Unchanged {
+        /// 读回的当前聚合（读不出为 `None`）。
+        current: Option<AggFunc>,
+        /// 给模型看的一句话说明与下一步。
+        reason: String,
+    },
 }
 
 /// 日期分组周期（`group_dates` 的 Periods 数组语义化下标）。
@@ -374,6 +393,7 @@ impl PivotTable {
     }
 
     /// 添加值字段，如 `add_data("销售额", AggFunc::Sum)`；已在值区域的字段**只改口径**。
+    /// 返回 [`AddDataOutcome`]：口径没改成是 `Unchanged { current, reason }`，不是字符串暗号。
     ///
     /// 两条路分工明确（2026-10-19 真机探针）：
     /// - **进值区域**用 `PivotFields(源名).Orientation = xlDataField`（两个引擎都认）；
@@ -385,11 +405,11 @@ impl PivotTable {
     /// **防重**：`DataFields` 里已有同源名字段就只改口径、不再碰 Orientation —— WPS 上重复
     /// 设 Orientation 会多出「求和项:xxx2」（2026-10-16 实报）。
     ///
-    /// `Ok(s)` 里的 `s` 是**口径说明**（空串 = 就是 `func` 要的口径）：只有在改口径的调用
-    /// 本身失败、刷新重试后读回仍不是目标口径时才非空。这时不报错（值字段已经建好，报错会让
-    /// 调用方重发整条建表指令、撞上「at 被占」），但说明必须是**事实**（当前口径 + 原始错误），
-    /// 不能替引擎下「不支持」的结论。
-    pub fn add_data(&self, field: &str, func: AggFunc) -> Result<String> {
+    /// 返回 [`AddDataOutcome`]：`Applied` = 就是 `func` 要的口径；
+    /// `Unchanged` = 值字段已建好但口径没改成（附当前口径与原始错误）。
+    /// 口径没改成功不报错（值字段已经建好，报错会让调用方重发整条建表指令、撞上「at 被占」），
+    /// 但说明必须是**事实**（当前口径 + 原始错误），不能替引擎下「不支持」的结论。
+    pub fn add_data(&self, field: &str, func: AggFunc) -> Result<AddDataOutcome> {
         let (value_field, created) = match self.value_field_of(field) {
             Some(vf) => (vf, false),
             None => {
@@ -405,15 +425,15 @@ impl PivotTable {
             }
         };
         if value_field.func.map(|f| f.code()) == Some(func.code()) {
-            return Ok(String::new());
+            return Ok(AddDataOutcome::Applied);
         }
         // 新建的字段不必为「求和」再写一次：那是数值列的默认口径（文本列仍是默认计数）
         if created && func == AggFunc::Sum {
-            return Ok(String::new());
+            return Ok(AddDataOutcome::Applied);
         }
         // 读不出当前口径、又要的就是求和时也不碰：写上未必更准，还多一次可能抛错的调用
         if value_field.func.is_none() && func == AggFunc::Sum {
-            return Ok(String::new());
+            return Ok(AddDataOutcome::Applied);
         }
         // 改口径：失败一次就刷新后重试（值字段刚建出来可能还没生效）
         let mut failure = value_field.raw.put("Function", vec![func.code().into()]).err();
@@ -429,15 +449,18 @@ impl PivotTable {
             .and_then(|value| value.int().ok())
             .and_then(AggFunc::from_code);
         if known == Some(func) || (known.is_none() && failure.is_none()) {
-            return Ok(String::new());
+            return Ok(AddDataOutcome::Applied);
         }
         let got = known.map_or_else(|| "未知".to_string(), |f| format!("「{}」", f.prefix()));
-        Ok(format!(
-            "值字段「{field}」的聚合当前是{got}，设成「{}」没生效{}：可再发一次 pivot do=data,field={field},func={}（别重发 add）",
-            func.prefix(),
-            failure.map(|e| format!("（{e}）")).unwrap_or_default(),
-            func.key()
-        ))
+        Ok(AddDataOutcome::Unchanged {
+            current: known,
+            reason: format!(
+                "值字段「{field}」的聚合当前是{got}，设成「{}」没生效{}：可再发一次 pivot do=data,field={field},func={}（别重发 add）",
+                func.prefix(),
+                failure.map(|e| format!("（{e}）")).unwrap_or_default(),
+                func.key()
+            ),
+        })
     }
 
     /// 把字段挪出行/列/页/值区域（`Orientation = xlHidden`）—— 删「求和项:xxx2」这种
@@ -604,8 +627,8 @@ impl PivotTable {
 
     /// 在 `anchor`（如 "K3" 或 "Sheet2!K3"）处为字段创建切片器。
     ///
-    /// 切片器是**界面层对象**（浮动控件，同图表）：先 `app.set_fast(false)` 把屏幕刷新打开再调
-    /// （f-manager 侧的 excel op 就是 `repaint()` 守卫）。
+    /// 切片器是**界面层对象**（浮动控件，同图表）：调用前把屏幕刷新打开
+    /// （`app.fast_guard()` 会在退出时恢复调用前的真实设置；f-manager 侧另有 `repaint()` 守卫）。
     ///
     /// 缓存用 **`Add2` + SourceField 传「字段名」** —— 这是 WPS 录制器与实测能跑通的形态
     /// （实报：同样调用 `Add2(pt, "班级")` 的宏在 WPS 上正常，而 `Add(pt, <PivotField>, 名)` 会

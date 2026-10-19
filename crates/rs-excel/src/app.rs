@@ -13,7 +13,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Ole::GetActiveObject;
 
 use crate::com::dispatch::IDispatchWrapper;
-use crate::com::{sel_arg, sel_index};
+use crate::com::sel_index;
 use crate::com::variant::{CellValue, ComValue};
 use crate::engine::{ComApartment, ConnectMode, Engine};
 use crate::error::ExcelError;
@@ -34,6 +34,8 @@ pub enum WindowState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CalcMode {
     Automatic = -4105,
+    /// Excel 的「自动（除数据表外）」；WPS 可能不认，恢复时原样写回。
+    SemiAutomatic = 2,
     Manual = -4135,
 }
 
@@ -151,10 +153,16 @@ impl App {
         self.raw.put("EnableEvents", vec![on.into()])
     }
 
+    /// 事件响应当前是否开启（批量守卫恢复原值用）。
+    pub fn events_enabled(&self) -> Result<bool> {
+        self.raw.get("EnableEvents")?.bool()
+    }
+
     /// 当前计算模式。
     pub fn calculation(&self) -> Result<CalcMode> {
         Ok(match self.raw.get("Calculation")?.int()? {
             -4135 => CalcMode::Manual,
+            2 => CalcMode::SemiAutomatic,
             _ => CalcMode::Automatic,
         })
     }
@@ -179,7 +187,8 @@ impl App {
     /// - `on=true`：关屏幕刷新 + 关事件 + 关弹窗 + 手动计算（批量操作前提速）；
     /// - `on=false`：全部恢复默认（刷新/事件/弹窗开启，自动计算）。
     ///
-    /// 用法：批量操作前 `set_fast(true)`，结束 `set_fast(false)`。
+    /// **注意**：`on=false` 恢复的是默认值（刷新/事件/弹窗开、自动计算），不是调用前的状态。
+    /// 需要「用完恢复原样」时用 [`App::fast_guard`]（RAII，嵌套安全）。
     pub fn set_fast(&self, on: bool) -> Result<()> {
         self.raw.put("ScreenUpdating", vec![(!on).into()])?;
         self.raw.put("EnableEvents", vec![(!on).into()])?;
@@ -188,6 +197,12 @@ impl App {
             "Calculation",
             vec![(if on { CalcMode::Manual } else { CalcMode::Automatic } as i32).into()],
         )
+    }
+
+    /// 批量提速守卫：快照当前刷新/事件/弹窗/计算设置，关闭后返回 RAII 守卫，
+    /// 退出（含提前 return / 报错）时恢复**原值**。嵌套调用只有最外层真正改设置。
+    pub fn fast_guard(&self) -> Result<crate::ai::FastGuard<'_>> {
+        Ok(crate::ai::FastGuard::new(self)?)
     }
 
     /// 清除剪贴板复制状态（复制/粘贴后调用）。
@@ -368,14 +383,42 @@ impl App {
         Ok(out)
     }
 
-    /// 按序号（1 基，须在范围内，否则按名称）绑定已打开的工作簿。
-    pub fn workbook(&self, idx_or_name: &str) -> Result<Workbook> {
+    /// 按**名称**绑定已打开的工作簿（数字名称也按名称解释）。
+    /// 序号请用 [`App::workbook_at`] —— 与工作表一样，不再靠「字符串像不像数字」猜。
+    pub fn workbook(&self, name: &str) -> Result<Workbook> {
+        let wbs = self.raw.get_obj("Workbooks", "Workbooks")?;
+        let raw = wbs
+            .call("Item", vec![name.into()])
+            .and_then(|v| v.idispatch_child(name))
+            .map_err(|e| ExcelError::hint(e, "工作簿未打开或名称错误：先用 workbooks() 列出"))?;
+        Ok(Workbook::from_raw(raw))
+    }
+
+    /// 按序号（1 基）绑定已打开的工作簿。
+    pub fn workbook_at(&self, index: i32) -> Result<Workbook> {
+        if index < 1 {
+            return Err(ExcelError::new(
+                "workbook_at",
+                "Application",
+                format!("工作簿序号从 1 开始（得到 {index}）"),
+            )
+            .into());
+        }
         let wbs = self.raw.get_obj("Workbooks", "Workbooks")?;
         let count = wbs.get("Count")?.int()?;
+        if index > count {
+            return Err(ExcelError::new(
+                "workbook_at",
+                "Application",
+                format!("工作簿序号 {index} 超出范围（共 {count} 本）"),
+            )
+            .with_hint("先用 workbooks() 看序号")
+            .into());
+        }
         let raw = wbs
-            .call("Item", vec![sel_arg(idx_or_name, count)])
-            .and_then(|v| v.idispatch_child(idx_or_name))
-            .map_err(|e| ExcelError::hint(e, "工作簿未打开或名称/序号错误：先用 workbooks() 列出"))?;
+            .call("Item", vec![index.into()])
+            .and_then(|v| v.idispatch_child(&format!("工作簿[{index}]")))
+            .map_err(|e| ExcelError::hint(e, "工作簿序号不存在：先用 workbooks() 列出"))?;
         Ok(Workbook::from_raw(raw))
     }
 

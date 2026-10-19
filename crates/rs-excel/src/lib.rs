@@ -8,21 +8,25 @@
 //! use rs_excel::prelude::*;
 //!
 //! let app = App::connect(Engine::Wps, ConnectMode::Attach)?; // 接管已打开的 WPS
-//! let wb = app.workbook("Book1")?;                          // 按序号或名称绑定
+//! let wb = app.workbook("Book1")?;                          // 按名称绑定工作簿
 //! let sheet = wb.active_sheet()?;
-//! sheet.write_tsv("A1", "姓名\t数量\n苹果\t12\n香蕉\t34")?;   // 一段 TSV 写一块区域
+//! sheet.write_tsv("A1", "姓名\t数量\n苹果\t12\n香蕉\t34")?;   // TSV 只给人/CLI 用
 //! let v = sheet.range("B2")?.value()?;                      // 读单元格
 //! sheet.range("A1:B1")?.set_font(Some(true), None, None, None, None)?; // 加粗
 //! ```
 //!
 //! ## 设计要点
 //!
-//! - **AI 友好**：所有错误为单行结构化格式
-//!   `[操作] @ 对象路径 | 底层原因 | 提示: 修复建议`，一次读取即可定位。
-//! - **批量读写**：`write_tsv` / `read_tsv` 一段文本搞定整块区域，最省 token。
+//! - **AI 门面**：[`ai`] 模块把「面向模型的接口」收成类型化原语：`Target`（book/sheet/range）、
+//!   `CellInput`（文本/数字/布尔/空/公式/日期）、`Matrix`（带截断信息）、`WriteReport`、
+//!   `FastGuard`、`ToolError`（code/category/hint/retryable/outcome）。库本身不引入 serde，
+//!   JSON 编解码留在调用方。
+//! - **错误**：底层 `anyhow` + [`ExcelError`]（单行 `[操作] @ 对象路径 | 底层原因 | 提示`）；
+//!   工具层用 [`ai::ToolError`] 拿到稳定错误码与是否可重试。
 //! - **最快路径默认**：值/公式读写默认走 `Value2` / `Formula2`（日期返回序列值）；
 //!   旧 `Value` / `Formula` 语义（日期转可读文本）用 `_compat` 后缀方法访问。
-//! - **批量提速**：批量操作前 `app.set_fast(true)`（四合一批量模式），结束 `set_fast(false)` 恢复。
+//! - **批量提速**：用 [`App::fast_guard`] 取 RAII 守卫 —— 快照并恢复**调用前的真实设置**
+//!   （刷新/事件/弹窗/计算），嵌套安全；`set_fast(false)` 只恢复默认值，不要拿它做撤销。
 //! - **扩展性**：库未封装的 COM 成员用 `.raw().get/call/call_named/put` 一行直调：
 //!   ```no_run
 //!   sheet.raw().call("PageSetup", vec![])?.idispatch()?.put("Zoom", vec![false.into()])?;
@@ -59,6 +63,7 @@
 //!   ```
 //! - **颜色格式**：COM 内部为 OLE 格式 `0x00BBGGRR`，统一用 [`rgb`] 助手构造。
 
+pub mod ai;
 pub mod com;
 pub mod condfmt;
 pub mod engine;
@@ -80,6 +85,12 @@ mod workbook;
 mod worksheet;
 
 pub mod prelude {
+    pub use crate::ai::{
+        clean_addr, col_letters, fast, is_iso_date, pick_workbook, write_grid, AiResult, CellInput,
+        Category, FastGuard,
+        Matrix, Outcome, OverwritePolicy, ParsedTarget, Projection, ReadWindow, SaveReport, Target,
+        ToolError, WritePath, WriteReport,
+    };
     pub use crate::app::{App, CalcMode, WindowInfo, WindowState};
     pub use crate::chart::{Chart, ChartKind};
     pub use crate::vba::VbaGuard;
@@ -92,7 +103,7 @@ pub mod prelude {
     pub use crate::fonts::system_font_names;
     pub use crate::history::{History, UndoEntry};
     pub use crate::pagesetup::{Margin, Orientation, PageSetup, PaperSize, Section};
-    pub use crate::pivot::{AggFunc, DatePart, PivotFieldInfo, PivotItemInfo, PivotTable, Slicer, SlicerItemInfo};
+    pub use crate::pivot::{AddDataOutcome, AggFunc, DatePart, PivotFieldInfo, PivotItemInfo, PivotTable, Slicer, SlicerItemInfo};
     pub use crate::process::{bring_to_front, flash_window, kill, kill_all, processes, restore_if_minimized, ProcessInfo};
     pub use crate::range::{AlignH, AlignV, EndDir, Range, SpecialCells};
     pub use crate::shape::{
@@ -117,7 +128,7 @@ pub use events::{AppState, EventMonitor, ExcelEvent};
 pub use fonts::system_font_names;
 pub use history::{History, UndoEntry};
 pub use pagesetup::{Margin, Orientation, PageSetup, PaperSize, Section};
-pub use pivot::{AggFunc, DatePart, PivotFieldInfo, PivotItemInfo, PivotTable, Slicer, SlicerItemInfo};
+pub use pivot::{AddDataOutcome, AggFunc, DatePart, PivotFieldInfo, PivotItemInfo, PivotTable, Slicer, SlicerItemInfo};
 pub use process::{bring_to_front, flash_window, kill, kill_all, processes, restore_if_minimized, ProcessInfo};
 pub use range::{AlignH, AlignV, EndDir, Range, SpecialCells};
 pub use shape::{

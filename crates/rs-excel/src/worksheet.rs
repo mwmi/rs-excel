@@ -12,6 +12,7 @@ use crate::range::Range;
 use crate::shape::Shapes;
 
 /// 工作表（Worksheet COM 对象）。
+#[derive(Clone)]
 pub struct Worksheet {
     raw: IDispatchWrapper,
 }
@@ -213,7 +214,7 @@ impl Worksheet {
         let cols = grid[0].len() as i32;
         let end = format!("{}{}", num_to_col(c0 + cols - 1), r0 + rows - 1);
         let rng = self.range(&format!("{anchor}:{end}"))?;
-        rng.set_values(&grid)
+        rng.set_values(&grid).map(|_| ())
     }
 
     /// 形状集合（图形/图片/文本框/连接线/图表等的增删改查入口）。

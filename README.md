@@ -16,7 +16,7 @@ crates/
 use rs_excel::prelude::*;
 
 let app = App::connect(Engine::Wps, ConnectMode::Attach)?;   // 接管已打开的 WPS
-let wb = app.workbook("Book1")?;                             // 按序号("1")或名称绑定
+let wb = app.workbook("Book1")?;                             // 按名称绑定（序号用 workbook_at）
 let sheet = wb.active_sheet()?;
 
 sheet.write_tsv("A1", "姓名\t数量\n苹果\t12\n香蕉\t34")?;     // 一段 TSV 写一块区域
@@ -30,7 +30,8 @@ rng.set_alignment(Some(AlignH::Center), None, None)?;        // 居中
 let chart = sheet.add_chart(ChartKind::Column, "A1:B3", "D2")?; // 图表
 chart.set_title("数量统计")?;
 
-wb.save_as(r"D:\out.xlsx", FileFormat::Xlsx)?;
+// 覆盖已有文件由策略处理（默认目标存在就报错；Replace 先备份再写）
+wb.save_as(r"D:\out.xlsx", FileFormat::Xlsx, OverwritePolicy::Replace)?;
 wb.export_pdf(r"D:\out.pdf")?;
 ```
 
@@ -40,8 +41,8 @@ wb.export_pdf(r"D:\out.pdf")?;
 
 | 对象          | 获取方式                         | 常用能力                                                                                                                                                                                                                                                                                                      |
 | ----------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `App`       | `App::connect(engine, mode)` | `visible` / `display_alerts` / `window_state` / `windows()` / `workbooks()` / `workbook(n或名)` / `active_workbook()` / `new_workbook()` / `open_workbook(path)` / `quit()`                                                                                                                                 |
-| `Workbook`  | `app.workbook(...)` 等        | `name/full_name/path/is_saved` / `sheets()` / `sheet(n或名)` / `active_sheet()` / `add_sheet(name, before)` / `save` / `save_as` / `export_pdf` / `close(save)`                                                                                                                                             |
+| `App`       | `App::connect(engine, mode)` | `visible` / `display_alerts` / `window_state` / `windows()` / `workbooks()` / `workbook(name)` / `workbook_at(index)` / `active_workbook()` / `new_workbook()` / `open_workbook(path)` / `fast_guard()` / `quit()`                                                                                         |
+| `Workbook`  | `app.workbook(...)` 等        | `name/full_name/path/is_saved` / `sheets()` / `sheet(name)` / `sheet_at(index)` / `active_sheet()` / `add_sheet(name, before)` / `save` / `save_as(path, format, policy)` / `export_pdf` / `close(save)`                                                                                                    |
 | `Worksheet` | `wb.sheet(...)` 等            | `name/rename/index/tab_color/visible` / `range(addr)` / `cells(r,c)` / `used_range()` / `rows/columns` / `read_tsv/write_tsv` / `add_chart(...)` / `activate/select/delete`                                                                                                                               |
 | `Range`     | `sheet.range("A1:C3")`       | 读：`value/values/text/read_tsv/formula/address/rows/columns`；写：`set_value/set_values/write_tsv/set_formula/number_format`；格式：`merge/unmerge/is_merged/set_alignment/col_width/row_height/auto_fit`；样式入口：`font()/interior()/borders()/set_font(...)`；清理：`clear/clear_contents/clear_formats`；`copy_to(dst)` |
 | `Font`      | `range.font()`               | `bold/italic/underline/size/color/name/set_strikethrough`（get+set）                                                                                                                                                                                                                                        |
@@ -51,17 +52,18 @@ wb.export_pdf(r"D:\out.pdf")?;
 | `Vba`       | `Vba::new(&app)`             | `status()` / `run_macro(name, args)` / `execute(code, entry)`                                                                                                                                                                                                                                             |
 | 底层          | 任意对象 `.raw()`                | `get/call/call_named/put/put_raw` —— 直调任意 COM 成员                                                                                                                                                                                                                                                          |
 
-## AI 调用要点（省 token 设计）
+## AI / 工具层要点
 
-1. **批量读写用 TSV**：`write_tsv(anchor, "a\tb\nc\td")` / `read_tsv(addr)` —— 一次调用处理整块区域，避免逐格循环。
-2. **错误即定位**：所有错误单行输出四要素，AI 一次读取即可修复：
-   ```
-   [put('Value')] @ WPS > Book1.xlsx > Sheet1 > A1:C3 | 0x800A03EC ... | 提示: 区域形状需与数据一致
-   ```
-3. **类型自动推断**：`write_tsv` 中数字/布尔自动转类型，`=` 开头写公式，前导 0 的串保持文本。
-4. **颜色**：COM 内部为 OLE 格式 `0x00BBGGRR`，**统一用** **`rgb(r, g, b)`** **构造**，不要手写整数。
-5. **日期**：单元格日期以 Excel 序列值（f64）返回，配合 `number_format("yyyy-mm-dd")` 展示。
-6. **连接模型**：`ConnectMode::Attach` 接管已打开实例（不干扰用户）；`ConnectMode::New` 新建实例（用完调 `app.quit()`）。COM 单线程使用；`App` 内部已托管 COM 初始化，无需关心。
+面向模型的接口在 `rs_excel::ai` 模块，JSON 编解码由调用方负责，库不依赖 serde：
+
+1. **目标显式**：`ai::Target { book, sheet, range }` —— 工作表/工作簿都按**名称**选，序号走 `sheet_at` / `workbook_at`；`range` 接受 `A1`、`A1:C3`、`A:C`、`3:3`，也兼容 `Sheet2!A1`。
+2. **写入用自然类型**：`ai::CellInput`（`Text/Number/Bool/Empty/Formula/Date`）+ `ai::write_grid`。JSON 字符串就是文本（`"001"` 不丢前导零）、数字才是数字、`=` 开头写公式、`null` 清空；日期写 `2026-01-05` 会变成真日期（一次 `NumberFormat` 数组补齐，不逐格调用）。
+3. **读取有预算**：`ai::Matrix::read_with` 按行列窗口返回 `addr/rows/cols/total_*/truncated`，调用方据此丢整行，不会出现半截 JSON。
+4. **错误结构化**：`ai::ToolError { code, category, hint, hresult, retryable, outcome }`，调用方不必从单行文本里猜能不能重试；底层 `ExcelError` 仍是单行四要素。
+5. **状态保护**：`App::fast_guard()` 快照刷新/事件/弹窗/计算并恢复**原值**，嵌套安全；不要再用 `set_fast(false)` 当撤销。
+6. **保存安全**：`Workbook::save_as(path, format, policy)` 默认目标存在就报错，`Replace` 先改名备份、失败回滚；不要自己删目标文件。
+7. **连接模型**：`ConnectMode::Attach` 只是「接管已打开实例」，**不等于只读**；写权限由调用方控制。COM 单线程使用；`App` 内部已托管 COM 初始化。
+8. **TSV 只给 CLI / 人工**：`read_tsv` / `write_tsv` 保留给 REPL，不作为机器协议。
 
 ## 扩展指南（添加缺失的 COM API）
 

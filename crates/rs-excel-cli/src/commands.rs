@@ -192,7 +192,11 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
             if args.is_empty() {
                 bail!("用法: use <序号|名称>");
             }
-            let wb = st.app()?.workbook(args)?;
+            // 序号与名称分开：纯数字按序号，其余按名称（库不再用「像数字就当索引」猜）
+            let wb = match args.trim().parse::<i32>() {
+                Ok(index) => st.app()?.workbook_at(index)?,
+                Err(_) => st.app()?.workbook(args)?,
+            };
             st.set_wb(wb)?;
             println!("已选定工作簿: {}", st.wb_label);
         }
@@ -230,13 +234,19 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
             if args.is_empty() {
                 bail!("用法: saveas <绝对路径>（按扩展名自动选格式）");
             }
-            st.wb()?.save_as(args, infer_format(args))?;
+            // REPL 是人工显式命令：覆盖时先备份原文件（库不再要求调用方自己删文件）
+            let report = st
+                .wb()?
+                .save_as(args, infer_format(args), OverwritePolicy::Replace)?;
             if let Some(wb) = &st.wb {
                 if let Ok(name) = wb.name() {
                     st.wb_label = name;
                 }
             }
-            println!("已另存为: {args}");
+            println!("已另存为: {}", report.path);
+            if let Some(backup) = report.backup {
+                println!("原文件已备份: {backup}");
+            }
         }
         "pdf" => {
             if args.is_empty() {
@@ -282,7 +292,11 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
             if args.is_empty() {
                 bail!("用法: sheet <序号|名称>");
             }
-            let sh = st.wb()?.sheet(args)?;
+            // 序号与名称分开：纯数字按序号，其余按名称（库不再用「像数字就当索引」猜）
+            let sh = match args.trim().parse::<i32>() {
+                Ok(index) => st.wb()?.sheet_at(index)?,
+                Err(_) => st.wb()?.sheet(args)?,
+            };
             st.set_sheet(sh)?;
             println!("已选定工作表: {}", st.sheet_label);
         }

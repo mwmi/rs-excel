@@ -34,15 +34,25 @@ fn main() -> Result<()> {
     println!("B5 公式: {}", sheet.range("B5")?.formula()?);
     println!("B5 数值: {}", sheet.range("B5")?.value()?);
 
-    // 5. 区域批量读（TSV）
+    // 5. 区域批量读（TSV 只给 CLI / 人工；AI 用 ai::Matrix）
     println!("A1:B4 内容:\n{}", sheet.read_tsv("A1:B4")?);
 
-    // 5.5 批量模式 + UsedRange + evaluate（工作表函数统一入口）
-    app.set_fast(true)?;
-    println!("已用区域: {}", sheet.used_addr()?);
-    let total = app.evaluate("SUM(B2:B4)")?;
-    println!("evaluate SUM(B2:B4) = {total}");
-    app.set_fast(false)?;
+    // 5.5 批量模式（RAII：退出作用域恢复调用前的刷新/事件/弹窗/计算）+ evaluate
+    {
+        let _guard = app.fast_guard()?;
+        println!("已用区域: {}", sheet.used_addr()?);
+        let total = app.evaluate("SUM(B2:B4)")?;
+        println!("evaluate SUM(B2:B4) = {total}");
+    }
+
+    // 5.6 AI 门面：自然类型批量写（字符串 "001" 保持文本，日期写成真日期）
+    let grid = vec![
+        vec![CellInput::Text("001".into()), CellInput::Number(12.0)],
+        vec![CellInput::Date("2026-01-05".into()), CellInput::Empty],
+    ];
+    let block = sheet.range("H1")?.resize(2, 2)?;
+    let report = rs_excel::ai::write_grid(&block, &grid)?;
+    println!("写入 {}（{} 格，日期 {} 格）", report.addr, report.cells, report.dates);
 
     // 6. 图表
     let chart = sheet.add_chart(ChartKind::Column, "A1:B4", "D2")?;
@@ -57,11 +67,14 @@ fn main() -> Result<()> {
         if st.trust_access { "已开启" } else { "未开启" }
     );
 
-    // 8. 保存并关闭（WPS 覆盖确认框不响应 DisplayAlerts，演示需无人值守 → 调用方先删旧文件）
+    // 8. 保存并关闭（覆盖已有文件由库按策略备份处理，不需要调用方自己删文件）
     let out = std::env::current_dir()?.join("rs_excel_demo.xlsx");
-    let _ = std::fs::remove_file(&out);
-    wb.save_as(&out.to_string_lossy(), FileFormat::Xlsx)?;
-    println!("已保存: {}", out.display());
+    let report = wb.save_as(
+        &out.to_string_lossy(),
+        FileFormat::Xlsx,
+        OverwritePolicy::Replace,
+    )?;
+    println!("已保存: {}", report.path);
     wb.close(false)?;
     app.quit()?;
     Ok(())

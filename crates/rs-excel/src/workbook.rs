@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 
+use crate::ai::save::{OverwritePolicy, SaveReport};
 use crate::com::dispatch::IDispatchWrapper;
-use crate::com::sel_arg;
 use crate::com::variant::{CellValue, ComValue};
 use crate::error::{ole_to_hex, ExcelError};
 use crate::worksheet::Worksheet;
@@ -40,7 +40,8 @@ pub enum FileFormat {
     Csv = 6,
 }
 
-/// 工作簿（Workbook COM 对象）。
+/// 工作簿（Workbook COM 对象）。`Clone` 只是 AddRef 同一个 COM 对象。
+#[derive(Clone)]
 pub struct Workbook {
     raw: IDispatchWrapper,
 }
@@ -125,14 +126,42 @@ impl Workbook {
         Ok(out)
     }
 
-    /// 按序号（1 基，须在范围内，否则按名称）绑定工作表。
-    pub fn sheet(&self, idx_or_name: &str) -> Result<Worksheet> {
+    /// 按**名称**绑定工作表（纯数字名称也按名称解释）。
+    /// 按序号请用 [`Workbook::sheet_at`] —— 名称与序号不再靠「字符串像不像数字」猜。
+    pub fn sheet(&self, name: &str) -> Result<Worksheet> {
+        let sheets = self.raw.get_obj("Worksheets", "Worksheets")?;
+        let raw = sheets
+            .call("Item", vec![name.into()])
+            .and_then(|v| v.idispatch_child(name))
+            .map_err(|e| ExcelError::hint(e, "工作表名称不存在：先用 sheets() 列出"))?;
+        Ok(Worksheet::from_raw(raw))
+    }
+
+    /// 按序号（1 基）绑定工作表。
+    pub fn sheet_at(&self, index: i32) -> Result<Worksheet> {
+        if index < 1 {
+            return Err(ExcelError::new(
+                "sheet_at",
+                self.name().unwrap_or_default(),
+                format!("工作表序号从 1 开始（得到 {index}）"),
+            )
+            .into());
+        }
         let sheets = self.raw.get_obj("Worksheets", "Worksheets")?;
         let count = sheets.get("Count")?.int()?;
+        if index > count {
+            return Err(ExcelError::new(
+                "sheet_at",
+                self.name().unwrap_or_default(),
+                format!("工作表序号 {index} 超出范围（共 {count} 张）"),
+            )
+            .with_hint("先用 sheets() 看序号")
+            .into());
+        }
         let raw = sheets
-            .call("Item", vec![sel_arg(idx_or_name, count)])
-            .and_then(|v| v.idispatch_child(idx_or_name))
-            .map_err(|e| ExcelError::hint(e, "工作表序号或名称不存在：先用 sheets() 列出"))?;
+            .call("Item", vec![index.into()])
+            .and_then(|v| v.idispatch_child(&format!("工作表[{index}]")))
+            .map_err(|e| ExcelError::hint(e, "工作表序号不存在：先用 sheets() 列出"))?;
         Ok(Worksheet::from_raw(raw))
     }
 
@@ -195,11 +224,22 @@ impl Workbook {
         self.raw.call("Save", vec![]).map(|_| ())
     }
 
-    /// 另存为（绝对路径 + 格式）。
+    /// 另存为（绝对路径 + 格式 + 覆盖策略）。
     ///
-    /// 注意：目标文件已存在时会弹覆盖确认框（WPS 该弹窗不响应 DisplayAlerts）；
-    /// 需免弹窗覆盖的场景由调用方先行删除目标文件。
-    pub fn save_as(&self, path: &str, format: FileFormat) -> Result<()> {
+    /// 默认 [`OverwritePolicy::FailIfExists`]：目标已存在就报 `FILE_EXISTS`，**不删不覆盖**。
+    /// `Replace` 先把原文件改名备份再写，失败回滚 —— 调用方不需要也不应该自己删文件。
+    pub fn save_as(
+        &self,
+        path: &str,
+        format: FileFormat,
+        policy: OverwritePolicy,
+    ) -> Result<SaveReport> {
+        Ok(crate::ai::save::save_as(self, path, format, policy)?)
+    }
+
+    /// 底层 `SaveAs`（不做存在性检查；覆盖已有文件时 WPS 可能弹覆盖确认框）。
+    /// 只供 [`crate::ai::save`] 在备份/策略处理之后调用。
+    pub(crate) fn save_as_raw(&self, path: &str, format: FileFormat) -> Result<()> {
         self.raw
             .call("SaveAs", vec![path.into(), (format as i32).into()])
             .map(|_| ())
