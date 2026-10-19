@@ -48,7 +48,9 @@ pub enum AggFunc {
 impl AggFunc {
     pub fn code(self) -> i32 {
         match self {
-            Self::Sum => -4105,
+            // **xlSum = -4157**：-4105 是 xlAutomatic，WPS 拿它设 Function 直接抛
+            // 0x80020009（2026-10-19 实测：默认求和字段读回 -4157，写 -4105 必挂）
+            Self::Sum => -4157,
             Self::Average => -4106,
             Self::Count => -4112,
             Self::CountNums => -4113,
@@ -72,6 +74,21 @@ impl AggFunc {
             Self::Product => "乘积项",
             Self::StdDev => "标准差项",
             Self::Var => "方差项",
+        }
+    }
+
+    /// 聚合名的英文键（回执里给 AI 的写法，与 op 层「字段:average」一致）
+    fn key(self) -> &'static str {
+        match self {
+            Self::Sum => "sum",
+            Self::Average => "average",
+            Self::Count => "count",
+            Self::CountNums => "countnums",
+            Self::Max => "max",
+            Self::Min => "min",
+            Self::Product => "product",
+            Self::StdDev => "stddev",
+            Self::Var => "var",
         }
     }
 
@@ -126,6 +143,18 @@ pub struct PivotFieldInfo {
     pub source_name: String,
     /// hidden / row / col / page / data
     pub orientation: String,
+}
+
+/// 值区域里的一个数据字段（WPS 上只存在于 `DataFields`，Excel 两处都有）。
+#[derive(Clone)]
+struct ValueField {
+    raw: IDispatchWrapper,
+    /// 显示名，如「平均值项:总分」
+    name: String,
+    /// 数据源列名
+    source: String,
+    /// 当前聚合口径（引擎读不出来时为 None）
+    func: Option<AggFunc>,
 }
 
 /// 透视字段项快照。
@@ -206,18 +235,65 @@ impl PivotTable {
             .map_err(|e| ExcelError::hint(e, format!("字段 \"{name}\" 不存在：用 fields() 查看可用字段名")))
     }
 
-    /// 数据字段唯一名：AutoSort/AutoShow 需 SourceName 而非显示名（如 "求和项:销售额" 的
-    /// SourceName 为 "销售额"），自动解析失败时回退原名。
-    fn source_name_of(&self, data_field: &str) -> String {
+    /// 值区域的字段清单。**必须走 `DataFields`**：WPS 的 `PivotFields` 集合里根本没有数据
+    /// 字段 —— 按源名查到的只是那个隐藏的基础字段（`Orientation` 读回 0，`Function` 读写都抛
+    /// 0x80020009），而 `DataFields` 里的对象 Name / SourceName / Function 读写都正常
+    /// （2026-10-19 真机探针：按显示名或 DataFields 改口径，平均值 320 立刻生效）。
+    fn value_fields(&self) -> Vec<ValueField> {
+        let Ok(coll) = self.raw.get_obj("DataFields", "DataFields") else { return Vec::new() };
+        let Ok(count) = coll.get("Count").and_then(|v| v.int()) else { return Vec::new() };
+        let mut out = Vec::with_capacity(count.max(0) as usize);
+        for i in 1..=count {
+            let Ok(raw) = coll.call("Item", vec![i.into()]).and_then(|v| v.idispatch()) else { continue };
+            let name = raw.get("Name").ok().and_then(|v| v.string().ok()).unwrap_or_default();
+            let source = raw
+                .get("SourceName")
+                .ok()
+                .and_then(|v| v.string().ok())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| name.clone());
+            let func = raw.get("Function").ok().and_then(|v| v.int().ok()).and_then(AggFunc::from_code);
+            out.push(ValueField { raw, name, source, func });
+        }
+        out
+    }
+
+    /// 按「显示名 → 显示名后缀（`求和项:销售额` 的 `销售额`）→ 源名」认值字段。
+    fn value_field_of(&self, field: &str) -> Option<ValueField> {
+        let want = field.trim();
+        let all = self.value_fields();
+        all.iter()
+            .find(|vf| vf.name == want)
+            .or_else(|| {
+                all.iter().find(|vf| {
+                    vf.name.rsplit_once([':', '：']).is_some_and(|(_, tail)| tail.trim() == want)
+                })
+            })
+            .or_else(|| all.iter().find(|vf| vf.source == want))
+            .cloned()
+    }
+
+    /// 刚加进值区域的那个字段（DataFields 追加在末尾）。
+    fn last_value_field(&self) -> Option<ValueField> {
+        self.value_fields().pop()
+    }
+
+    /// AutoSort / AutoShow 的 `Field` 参数要**值字段的显示名**（如「平均值项:总分」），
+    /// **不是源列名**：传源名两个引擎都收下（返回成功）但一行都不动（2026-10-19 实测：
+    /// 传「总分」顺序不变，传「平均值项:总分」立刻按值排序）。
+    fn sort_key_of(&self, data_field: &str) -> String {
+        if let Some(vf) = self.value_field_of(data_field) {
+            return vf.name;
+        }
         for name in [data_field.to_string(), format!("求和项:{data_field}")] {
-            if let Some(s) = self
+            if let Some(display) = self
                 .field(&name)
                 .ok()
-                .and_then(|pf| pf.get("SourceName").ok())
+                .and_then(|pf| pf.get("Name").ok())
                 .and_then(|v| v.string().ok())
                 .filter(|s| !s.is_empty())
             {
-                return s;
+                return display;
             }
         }
         data_field.to_string()
@@ -249,6 +325,14 @@ impl PivotTable {
             }
             .to_string();
             out.push(PivotFieldInfo { name, source_name, orientation });
+        }
+        // 值字段补进来：WPS 的 PivotFields 枚举不到它们（源列只报 hidden），缺了它们
+        // AI 既看不到「求和项:xxx」这种真名字，也判断不出当前聚合口径
+        for vf in self.value_fields() {
+            if out.iter().any(|f| f.orientation == "data" && (f.name == vf.name || f.source_name == vf.source)) {
+                continue;
+            }
+            out.push(PivotFieldInfo { name: vf.name, source_name: vf.source, orientation: "data".into() });
         }
         Ok(out)
     }
@@ -289,61 +373,70 @@ impl PivotTable {
             .map(|_| ())
     }
 
-    /// 添加值字段，如 `add_data("销售额", AggFunc::Sum)`。
+    /// 添加值字段，如 `add_data("销售额", AggFunc::Sum)`；已在值区域的字段**只改口径**。
     ///
-    /// **只走 `Orientation = xlDataField` 一条路**：两个引擎都认，值字段按引擎默认口径建出来
-    /// （数值列 = 求和、文本列 = 计数）。不用 `AddDataField`、也不依赖 `PivotField.Function` ——
-    /// WPS 上这两个都必抛 0x80020009（实报）。
+    /// 两条路分工明确（2026-10-19 真机探针）：
+    /// - **进值区域**用 `PivotFields(源名).Orientation = xlDataField`（两个引擎都认）；
+    /// - **读/改口径**只能走 `DataFields` 里的那个对象 —— WPS 的 `PivotFields(源名)` 拿到的是
+    ///   隐藏的基础字段，`Function` 读写都抛 0x80020009，而 `DataFields(i)` 的 `Function`
+    ///   读得回也写得进（平均值、求和、计数…全都生效）。以前拿前者当值字段，于是「改口径」
+    ///   必然失败，还带回一句「该引擎不让改」，模型转手就说「WPS 不支持平均值聚合」（实报）。
     ///
-    /// **防重不靠引擎**：WPS 上对已在值区域的字段再设一次 Orientation 会多出一列
-    /// 「求和项:xxx2」（实报：add 带 data 后又 data/set 同一字段，两个模型都建出重复列；
-    /// Excel 上同样是空操作）—— 所以设之前先翻 `fields()`，`SourceName` 对得上就直接
-    /// 当已加过，不再碰 Orientation。删重复列用 `remove_field`。
+    /// **防重**：`DataFields` 里已有同源名字段就只改口径、不再碰 Orientation —— WPS 上重复
+    /// 设 Orientation 会多出「求和项:xxx2」（2026-10-16 实报）。
     ///
-    /// `Ok(s)` 里的 `s` 是**口径说明**（空串 = 就是 `func` 要的口径）：引擎不让改口径时值字段
-    /// 仍然建好了，只是口径是引擎默认的 —— 这时**不能报错**（报错会让调用方重发整条建表指令、
-    /// 撞上「at 被占/重名」更难懂），把这句话原样带回给模型，让它改用公式或在回答里说明。
+    /// `Ok(s)` 里的 `s` 是**口径说明**（空串 = 就是 `func` 要的口径）：只有在改口径的调用
+    /// 本身失败、刷新重试后读回仍不是目标口径时才非空。这时不报错（值字段已经建好，报错会让
+    /// 调用方重发整条建表指令、撞上「at 被占」），但说明必须是**事实**（当前口径 + 原始错误），
+    /// 不能替引擎下「不支持」的结论。
     pub fn add_data(&self, field: &str, func: AggFunc) -> Result<String> {
-        // 防重（见方法文档）：字段已在值区域就不再设 Orientation，按 SourceName 认字段 ——
-        // 进了值区域后条目名常变成「求和项:源名」，拿源名照样认得出
-        let in_values = self
-            .fields()
-            .map(|all| all.iter().any(|f| f.orientation == "data" && f.source_name == field))
-            .unwrap_or(false);
-        if !in_values {
-            let pf = self.field(field)?;
-            pf.put("Orientation", vec![(4i32).into()]) // xlDataField
-                .map_err(|e| ExcelError::hint(e, "进不了值区域：值字段必须是数据源里的列"))?;
-        }
-        // 挪动后旧对象可能作废：按源名重取，取不到再试引擎给的默认显示名（求和项/计数项）
-        let data_field = self
-            .field(field)
-            .or_else(|_| self.field(&format!("求和项:{field}")))
-            .or_else(|_| self.field(&format!("计数项:{field}")))?;
-        // 求和是数值列的默认口径，不必碰 Function（WPS 那条 put 必抛）；
-        // 要别的口径：改一次，改不动就刷新一次再改（值字段刚建出来可能还没生效）
-        let mut applied = true;
-        if func != AggFunc::Sum {
-            applied = data_field.put("Function", vec![func.code().into()]).is_ok();
-            if !applied {
-                let _ = self.refresh();
-                applied = data_field.put("Function", vec![func.code().into()]).is_ok();
+        let (value_field, created) = match self.value_field_of(field) {
+            Some(vf) => (vf, false),
+            None => {
+                self.field(field)?
+                    .put("Orientation", vec![(4i32).into()]) // xlDataField
+                    .map_err(|e| ExcelError::hint(e, "进不了值区域：值字段必须是数据源里的列"))?;
+                // 刚建出来的数据字段只存在于 DataFields（WPS 的 PivotFields 里没有它）
+                let vf = self
+                    .value_field_of(field)
+                    .or_else(|| self.last_value_field())
+                    .ok_or_else(|| anyhow::anyhow!("值字段「{field}」已建出但取不到（DataFields 为空）"))?;
+                (vf, true)
             }
-        }
-        // 核对实际口径：读得出来就以它为准；**读不出来时信 put 的结果** —— getter 与 put 同源，
-        // 在部分引擎上同样必抛（0x80020009），读不到 ≠ 没改成。以前这里只要读不到就当「没改成」，
-        // 平均值整条改成功也会带回「引擎不让改口径」的说明，模型转手就告诉用户「不支持平均聚合」
-        //（2026-10-16 实报）
-        let known = data_field.get("Function").ok().and_then(|value| value.int().ok()).and_then(AggFunc::from_code);
-        if known == Some(func) || (known.is_none() && applied) {
+        };
+        if value_field.func.map(|f| f.code()) == Some(func.code()) {
             return Ok(String::new());
         }
-        let got = known.map_or("默认口径（数值列求和、文本列计数）".to_string(), |f| format!("「{}」", f.prefix()));
+        // 新建的字段不必为「求和」再写一次：那是数值列的默认口径（文本列仍是默认计数）
+        if created && func == AggFunc::Sum {
+            return Ok(String::new());
+        }
+        // 读不出当前口径、又要的就是求和时也不碰：写上未必更准，还多一次可能抛错的调用
+        if value_field.func.is_none() && func == AggFunc::Sum {
+            return Ok(String::new());
+        }
+        // 改口径：失败一次就刷新后重试（值字段刚建出来可能还没生效）
+        let mut failure = value_field.raw.put("Function", vec![func.code().into()]).err();
+        if failure.is_some() {
+            let _ = self.refresh();
+            failure = value_field.raw.put("Function", vec![func.code().into()]).err();
+        }
+        // 核对：读得出来就以它为准；**读不出来时信 put 的结果**（读不到 ≠ 没改成）
+        let known = value_field
+            .raw
+            .get("Function")
+            .ok()
+            .and_then(|value| value.int().ok())
+            .and_then(AggFunc::from_code);
+        if known == Some(func) || (known.is_none() && failure.is_none()) {
+            return Ok(String::new());
+        }
+        let got = known.map_or_else(|| "未知".to_string(), |f| format!("「{}」", f.prefix()));
         Ok(format!(
-            "值字段「{field}」实际口径是{got}（该引擎不让改，只给默认）——要的是「{}」：\
-             别再重发 data（值字段已经在值区域里），改用 write 把公式写进单元格\
-             （文本列先转成数值），或在回答里说明实际口径",
-            func.prefix()
+            "值字段「{field}」的聚合当前是{got}，设成「{}」没生效{}：可再发一次 pivot do=data,field={field},func={}（别重发 add）",
+            func.prefix(),
+            failure.map(|e| format!("（{e}）")).unwrap_or_default(),
+            func.key()
         ))
     }
 
@@ -351,6 +444,22 @@ impl PivotTable {
     /// 重复值字段、或撤掉某个行/列/页字段。字段名给源名或值区域里的显示名（「求和项:源名」）
     /// 都行；字段本就没放在任何区域时静默成功。
     pub fn remove_field(&self, field: &str) -> Result<()> {
+        // 值字段只能在 DataFields 里挪：按源名查到的 PivotFields("源名") 是那个隐藏的基础字段，
+        // 对它设 Orientation=0 什么也不会发生（值区域的列还在）
+        if let Some(vf) = self.value_field_of(field) {
+            let base = self
+                .field(field)
+                .ok()
+                .and_then(|pf| pf.get("Orientation").ok())
+                .and_then(|v| v.int().ok());
+            // 同名源列同时是行/列/页字段时，先别动它（用户要撤的可能是那个维度）
+            if vf.name == field.trim() || !matches!(base, Some(1..=3)) {
+                return vf
+                    .raw
+                    .put("Orientation", vec![(0i32).into()])
+                    .map_err(|e| ExcelError::hint(e, format!("值字段 \"{field}\" 挪不出值区域")));
+            }
+        }
         self.field(field)
             .or_else(|_| self.field(&format!("求和项:{field}")))
             .or_else(|_| self.field(&format!("计数项:{field}")))?
@@ -410,12 +519,12 @@ impl PivotTable {
     }
 
     /// 行/列字段按值字段排序（`descending=false` 升序）。
-    /// 值字段唯一名自动解析，AI 直接传数据源列名即可。
+    /// 值字段名自动解析（源名或「求和项:源名」都行），AI 直接传数据源列名即可。
     pub fn sort_by_value(&self, field: &str, data_field: &str, descending: bool) -> Result<()> {
-        let src = self.source_name_of(data_field);
+        let key = self.sort_key_of(data_field);
         let order: i32 = if descending { 2 } else { 1 }; // xlDescending / xlAscending
         self.field(field)?
-            .call("AutoSort", vec![order.into(), src.into()])
+            .call("AutoSort", vec![order.into(), key.into()])
             .map_err(|e| ExcelError::hint(e, "字段须已放在行/列区域（set_fields），data_field 须为值字段（add_data）"))
             .map(|_| ())
     }
@@ -429,12 +538,12 @@ impl PivotTable {
 
     /// 行/列字段 Top-N / Bottom-N 展示（`top=false` 取后 N）。
     pub fn show_top(&self, field: &str, data_field: &str, n: i32, top: bool) -> Result<()> {
-        let src = self.source_name_of(data_field);
+        let key = self.sort_key_of(data_field);
         let rule: i32 = if top { 1 } else { 2 }; // xlTop / xlBottom
         self.field(field)?
             .call(
                 "AutoShow",
-                vec![(1i32).into(), rule.into(), n.into(), src.into()], // xlAutomatic
+                vec![(1i32).into(), rule.into(), n.into(), key.into()], // xlAutomatic
             )
             .map_err(|e| ExcelError::hint(e, "字段须在行/列区域，data_field 须为值字段；n ≥ 1"))
             .map(|_| ())
